@@ -29,6 +29,17 @@ type oaiErrorDetail struct {
 	Code    string `json:"code"`
 }
 
+// anthropicErrorBody is the Anthropic-compatible JSON error response envelope.
+type anthropicErrorBody struct {
+	Type  string               `json:"type"`
+	Error anthropicErrorDetail `json:"error"`
+}
+
+type anthropicErrorDetail struct {
+	Type    string `json:"type"`
+	Message string `json:"message"`
+}
+
 // oaiModelsResponse is the OpenAI-format response for GET /v1/models.
 type oaiModelsResponse struct {
 	Object string     `json:"object"`
@@ -56,6 +67,18 @@ func writeOAIError(w http.ResponseWriter, status int, errType, code, message str
 			Message: message,
 			Type:    errType,
 			Code:    code,
+		},
+	})
+}
+
+func writeAnthropicError(w http.ResponseWriter, status int, errType, message string) {
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(status)
+	_ = json.NewEncoder(w).Encode(anthropicErrorBody{
+		Type: "error",
+		Error: anthropicErrorDetail{
+			Type:    errType,
+			Message: message,
 		},
 	})
 }
@@ -174,25 +197,16 @@ func (s *Server) handleInferenceProxy(w http.ResponseWriter, r *http.Request) {
 		Scheme: "http",
 		Host:   fmt.Sprintf("127.0.0.1:%d", lm.Port),
 	}
-	proxy := &httputil.ReverseProxy{
-		Director: func(req *http.Request) {
-			req.URL.Scheme = target.Scheme
-			req.URL.Host = target.Host
-			req.Host = target.Host
-		},
-		// FlushInterval -1: flush immediately on each write, required for SSE pass-through.
-		FlushInterval: -1,
-		ErrorHandler: func(w http.ResponseWriter, req *http.Request, err error) {
-			if s.logger != nil {
-				s.logger.Warn("upstream proxy error",
-					"path", req.URL.Path,
-					"error", err,
-				)
-			}
-			writeOAIError(w, http.StatusBadGateway, "server_error", "upstream_error",
-				fmt.Sprintf("upstream error: %v", err))
-		},
-	}
+	proxy := newReverseProxy(target, func(w http.ResponseWriter, req *http.Request, err error) {
+		if s.logger != nil {
+			s.logger.Warn("upstream proxy error",
+				"path", req.URL.Path,
+				"error", err,
+			)
+		}
+		writeOAIError(w, http.StatusBadGateway, "server_error", "upstream_error",
+			fmt.Sprintf("upstream error: %v", err))
+	})
 
 	// For persistent sessions, wrap w to capture the response for turn recording.
 	proxyW := http.ResponseWriter(w)
@@ -206,4 +220,87 @@ func (s *Server) handleInferenceProxy(w http.ResponseWriter, r *http.Request) {
 	if ses != nil {
 		s.recordTurns(ses, crw)
 	}
+}
+
+// newReverseProxy creates a reverse proxy targeting the given URL with
+// immediate flushing (required for SSE pass-through) and a custom error handler.
+func newReverseProxy(target *url.URL, errHandler func(http.ResponseWriter, *http.Request, error)) *httputil.ReverseProxy {
+	return &httputil.ReverseProxy{
+		Director: func(req *http.Request) {
+			req.URL.Scheme = target.Scheme
+			req.URL.Host = target.Host
+			req.Host = target.Host
+		},
+		FlushInterval: -1,
+		ErrorHandler:  errHandler,
+	}
+}
+
+// handleMessagesProxy handles POST /v1/messages by proxying the request to the
+// target llama-server's native /v1/messages endpoint. Errors are returned in
+// the Anthropic error envelope format. The inference hook and history session
+// machinery are intentionally not applied to this path.
+func (s *Server) handleMessagesProxy(w http.ResponseWriter, r *http.Request) {
+	buf, err := io.ReadAll(r.Body)
+	if err != nil {
+		writeAnthropicError(w, http.StatusBadRequest, "invalid_request_error",
+			fmt.Sprintf("failed to read request body: %v", err))
+		return
+	}
+
+	if len(buf) == 0 {
+		writeAnthropicError(w, http.StatusBadRequest, "invalid_request_error",
+			"request body is required")
+		return
+	}
+
+	var field inferenceModelField
+	if err := json.Unmarshal(buf, &field); err != nil {
+		writeAnthropicError(w, http.StatusBadRequest, "invalid_request_error",
+			fmt.Sprintf("invalid JSON in request body: %v", err))
+		return
+	}
+	if field.Model == "" {
+		writeAnthropicError(w, http.StatusBadRequest, "invalid_request_error",
+			"missing required field: model")
+		return
+	}
+
+	m, found := s.registry.GetByName(field.Model)
+	if !found {
+		writeAnthropicError(w, http.StatusNotFound, "not_found_error",
+			fmt.Sprintf("model %q is not available", field.Model))
+		return
+	}
+
+	lm, loaded := s.procMgr.Get(m.ID)
+	if !loaded {
+		writeAnthropicError(w, http.StatusNotFound, "not_found_error",
+			fmt.Sprintf("model %q is not loaded", field.Model))
+		return
+	}
+	if lm.Health() != processmanager.HealthStatusHealthy {
+		writeAnthropicError(w, http.StatusServiceUnavailable, "overloaded_error",
+			fmt.Sprintf("model %q is currently unavailable", field.Model))
+		return
+	}
+
+	r.Body = io.NopCloser(bytes.NewReader(buf))
+	r.ContentLength = int64(len(buf))
+
+	target := &url.URL{
+		Scheme: "http",
+		Host:   fmt.Sprintf("127.0.0.1:%d", lm.Port),
+	}
+	proxy := newReverseProxy(target, func(w http.ResponseWriter, req *http.Request, err error) {
+		if s.logger != nil {
+			s.logger.Warn("upstream proxy error",
+				"path", req.URL.Path,
+				"error", err,
+			)
+		}
+		writeAnthropicError(w, http.StatusBadGateway, "api_error",
+			fmt.Sprintf("upstream error: %v", err))
+	})
+	proxy.ServeHTTP(w, r)
 }

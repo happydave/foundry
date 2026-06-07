@@ -9,14 +9,14 @@ import (
 )
 
 type Config struct {
-	ModelScanPaths        []string `yaml:"model_scan_paths"`
-	LlamaServerBinary     string   `yaml:"llama_server_binary"`
-	LlamaServerExtraArgs  []string `yaml:"llama_server_extra_args"`
-	DefaultGPULayers      int      `yaml:"default_gpu_layers"`
-	KVCacheType           string   `yaml:"kv_cache_type"`
-	HistorySessionsDir    string   `yaml:"history_sessions_dir"`
-	ListenAddress         string   `yaml:"listen_address"`
-	LogLevel              string   `yaml:"log_level"`
+	ModelScanPaths       []string `yaml:"model_scan_paths"`
+	LlamaServerBinary    string   `yaml:"llama_server_binary"`
+	LlamaServerExtraArgs []string `yaml:"llama_server_extra_args"`
+	DefaultGPULayers     int      `yaml:"default_gpu_layers"`
+	KVCacheType          string   `yaml:"kv_cache_type"`
+	HistorySessionsDir   string   `yaml:"history_sessions_dir"`
+	ListenAddress        string   `yaml:"listen_address"`
+	LogLevel             string   `yaml:"log_level"`
 }
 
 func Load(path string) (*Config, error) {

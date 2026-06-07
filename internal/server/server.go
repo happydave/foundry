@@ -83,6 +83,7 @@ func newServer(addr string, reg modelRegistry, pm processManager, est resourceEs
 	mux.HandleFunc("GET /v1/models", s.handleOAIModels)
 	mux.HandleFunc("POST /v1/chat/completions", s.handleInferenceProxy)
 	mux.HandleFunc("POST /v1/completions", s.handleInferenceProxy)
+	mux.HandleFunc("POST /v1/messages", s.handleMessagesProxy)
 	mux.HandleFunc("/v1/", notImplemented)
 	mux.HandleFunc("GET /api/v1/status", s.handleStatus)
 	mux.HandleFunc("GET /api/v1/models", s.handleListModels)

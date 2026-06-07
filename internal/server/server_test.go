@@ -804,6 +804,167 @@ func TestInferenceProxy_CompletionsEndpoint(t *testing.T) {
 	_ = resp.Body.Close()
 }
 
+// --- POST /v1/messages ---
+
+func TestMessagesProxy_InvalidJSON(t *testing.T) {
+	f := newFixture(t)
+	body := strings.NewReader("{bad json")
+	req, _ := http.NewRequest(http.MethodPost, f.addr+"/v1/messages", body)
+	req.ContentLength = int64(body.Len())
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	assertStatus(t, resp, http.StatusBadRequest)
+	eb := decodeBody[anthropicErrorBody](t, resp)
+	if eb.Type != "error" {
+		t.Errorf("expected type=error, got %q", eb.Type)
+	}
+	if eb.Error.Message == "" {
+		t.Error("expected error message")
+	}
+}
+
+func TestMessagesProxy_EmptyBody(t *testing.T) {
+	f := newFixture(t)
+	resp := f.do(t, http.MethodPost, "/v1/messages", nil)
+	assertStatus(t, resp, http.StatusBadRequest)
+	eb := decodeBody[anthropicErrorBody](t, resp)
+	if eb.Type != "error" {
+		t.Errorf("expected type=error, got %q", eb.Type)
+	}
+}
+
+func TestMessagesProxy_MissingModelField(t *testing.T) {
+	f := newFixture(t)
+	body := strings.NewReader(`{"messages":[]}`)
+	req, _ := http.NewRequest(http.MethodPost, f.addr+"/v1/messages", body)
+	req.ContentLength = int64(body.Len())
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	assertStatus(t, resp, http.StatusBadRequest)
+	eb := decodeBody[anthropicErrorBody](t, resp)
+	if !strings.Contains(eb.Error.Message, "model") {
+		t.Errorf("expected error message to mention model field, got %q", eb.Error.Message)
+	}
+}
+
+func TestMessagesProxy_ModelNotInRegistry(t *testing.T) {
+	f := newFixture(t)
+	body := strings.NewReader(`{"model":"unknown-model","messages":[]}`)
+	req, _ := http.NewRequest(http.MethodPost, f.addr+"/v1/messages", body)
+	req.ContentLength = int64(body.Len())
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	assertStatus(t, resp, http.StatusNotFound)
+	eb := decodeBody[anthropicErrorBody](t, resp)
+	if eb.Error.Type != "not_found_error" {
+		t.Errorf("expected error type not_found_error, got %q", eb.Error.Type)
+	}
+}
+
+func TestMessagesProxy_ModelNotLoaded(t *testing.T) {
+	f := newFixture(t)
+	m := testModel(1)
+	f.reg.models = []registry.Model{m}
+
+	body := strings.NewReader(`{"model":"test-model","messages":[]}`)
+	req, _ := http.NewRequest(http.MethodPost, f.addr+"/v1/messages", body)
+	req.ContentLength = int64(body.Len())
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	assertStatus(t, resp, http.StatusNotFound)
+	eb := decodeBody[anthropicErrorBody](t, resp)
+	if eb.Error.Type != "not_found_error" {
+		t.Errorf("expected error type not_found_error, got %q", eb.Error.Type)
+	}
+}
+
+func TestMessagesProxy_ProxiesRequest(t *testing.T) {
+	var receivedPath string
+	var receivedBody []byte
+	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		receivedPath = r.URL.Path
+		receivedBody, _ = io.ReadAll(r.Body)
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(`{"type":"message","content":[]}`))
+	}))
+	defer backend.Close()
+
+	backendAddr := backend.Listener.Addr().(*net.TCPAddr)
+
+	f := newFixture(t)
+	m := testModel(1)
+	f.reg.models = []registry.Model{m}
+	f.pm.loaded[1] = &processmanager.LoadedModel{
+		ModelID: 1,
+		Port:    backendAddr.Port,
+	}
+
+	reqBody := `{"model":"test-model","max_tokens":1024,"messages":[{"role":"user","content":"hi"}]}`
+	body := strings.NewReader(reqBody)
+	req, _ := http.NewRequest(http.MethodPost, f.addr+"/v1/messages", body)
+	req.ContentLength = int64(body.Len())
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	assertStatus(t, resp, http.StatusOK)
+	_ = resp.Body.Close()
+
+	if receivedPath != "/v1/messages" {
+		t.Errorf("backend received path %q, want /v1/messages", receivedPath)
+	}
+	if string(receivedBody) != reqBody {
+		t.Errorf("backend received %q, want %q", receivedBody, reqBody)
+	}
+}
+
+func TestMessagesProxy_InferenceHookNotCalled(t *testing.T) {
+	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(`{"type":"message","content":[]}`))
+	}))
+	defer backend.Close()
+
+	backendAddr := backend.Listener.Addr().(*net.TCPAddr)
+
+	f := newFixture(t)
+	m := testModel(1)
+	f.reg.models = []registry.Model{m}
+	f.pm.loaded[1] = &processmanager.LoadedModel{
+		ModelID: 1,
+		Port:    backendAddr.Port,
+	}
+
+	hookCalled := false
+	f.srv.inferenceHook = func(w http.ResponseWriter, r *http.Request) bool {
+		hookCalled = true
+		return true
+	}
+
+	body := strings.NewReader(`{"model":"test-model","max_tokens":1024,"messages":[{"role":"user","content":"hi"}]}`)
+	req, _ := http.NewRequest(http.MethodPost, f.addr+"/v1/messages", body)
+	req.ContentLength = int64(body.Len())
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	assertStatus(t, resp, http.StatusOK)
+	_ = resp.Body.Close()
+
+	if hookCalled {
+		t.Error("inference hook must not be called for /v1/messages requests")
+	}
+}
+
 // --- Graceful shutdown (tests the http.Server directly) ---
 
 func TestServer_GracefulShutdown(t *testing.T) {
