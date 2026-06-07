@@ -129,7 +129,7 @@ func New(binary string, extraArgs []string, logger *slog.Logger) *Manager {
 //   - Already loaded: returns the existing record immediately (no new subprocess).
 //   - Load in progress: blocks until complete and returns the same outcome.
 //   - Load failed previously: starts a fresh load attempt.
-func (m *Manager) Load(ctx context.Context, modelID uint64, modelPath string, contextSize, gpuLayers int) (*LoadedModel, error) {
+func (m *Manager) Load(ctx context.Context, modelID uint64, modelPath, mmprojPath string, contextSize, gpuLayers int) (*LoadedModel, error) {
 	m.mu.Lock()
 
 	if m.closing {
@@ -153,7 +153,7 @@ func (m *Manager) Load(ctx context.Context, modelID uint64, modelPath string, co
 				return nil, ctx.Err()
 			}
 			// Re-enter after the in-progress operation completes.
-			return m.Load(ctx, modelID, modelPath, contextSize, gpuLayers)
+			return m.Load(ctx, modelID, modelPath, mmprojPath, contextSize, gpuLayers)
 
 		case kindFailed:
 			// Previous attempt failed; allow retry by falling through.
@@ -165,7 +165,7 @@ func (m *Manager) Load(ctx context.Context, modelID uint64, modelPath string, co
 	m.models[modelID] = e
 	m.mu.Unlock()
 
-	record, cmd, ph, loadErr := m.doLoad(ctx, modelID, modelPath, contextSize, gpuLayers)
+	record, cmd, ph, loadErr := m.doLoad(ctx, modelID, modelPath, mmprojPath, contextSize, gpuLayers)
 
 	m.mu.Lock()
 	if loadErr != nil {
@@ -189,7 +189,7 @@ func (m *Manager) Load(ctx context.Context, modelID uint64, modelPath string, co
 }
 
 // doLoad performs the actual subprocess launch, I/O wiring, and health polling.
-func (m *Manager) doLoad(ctx context.Context, modelID uint64, modelPath string, contextSize, gpuLayers int) (*LoadedModel, *exec.Cmd, *procHandle, error) {
+func (m *Manager) doLoad(ctx context.Context, modelID uint64, modelPath, mmprojPath string, contextSize, gpuLayers int) (*LoadedModel, *exec.Cmd, *procHandle, error) {
 	port, err := freePort()
 	if err != nil {
 		return nil, nil, nil, fmt.Errorf("model %d: no free port: %w", modelID, err)
@@ -201,6 +201,9 @@ func (m *Manager) doLoad(ctx context.Context, modelID uint64, modelPath string, 
 		"--n-gpu-layers", strconv.Itoa(gpuLayers),
 		"--port", strconv.Itoa(port),
 		"--host", "127.0.0.1",
+	}
+	if mmprojPath != "" {
+		args = append(args, "--mmproj", mmprojPath)
 	}
 	args = append(args, m.extraArgs...)
 	cmd := m.newCmd(m.binary, args...)

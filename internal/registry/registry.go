@@ -23,6 +23,7 @@ type Model struct {
 	HeadDim      uint32
 	MaxContext   uint32
 	Quantization string
+	MmprojPath   string
 }
 
 // Registry is the in-process catalogue of models discovered at startup. It is populated
@@ -92,7 +93,9 @@ func (r *Registry) scanDir(dir string, logger *slog.Logger) int {
 		return 0
 	}
 
-	added := 0
+	var textModels []Model
+	var mmprojPath string
+
 	for _, entry := range entries {
 		if entry.IsDir() {
 			continue
@@ -100,26 +103,52 @@ func (r *Registry) scanDir(dir string, logger *slog.Logger) int {
 		if !strings.EqualFold(filepath.Ext(entry.Name()), ".gguf") {
 			continue
 		}
-		if r.addModel(filepath.Join(dir, entry.Name()), logger) {
-			added++
+
+		path := filepath.Join(dir, entry.Name())
+		m, isMmproj, ok := r.parseModel(path, logger)
+		if !ok {
+			continue
 		}
+
+		if isMmproj {
+			if mmprojPath == "" {
+				mmprojPath = path
+			}
+		} else {
+			textModels = append(textModels, m)
+		}
+	}
+
+	added := 0
+	for _, m := range textModels {
+		if mmprojPath != "" {
+			m.MmprojPath = mmprojPath
+		}
+		idx := len(r.models)
+		r.models = append(r.models, m)
+		r.byID[m.ID] = idx
+		added++
 	}
 	return added
 }
 
-// addModel parses the GGUF file at path and, if all required metadata fields are present,
-// adds it to the registry. Returns true on success.
-func (r *Registry) addModel(path string, logger *slog.Logger) bool {
+// parseModel parses the GGUF file at path. Returns the Model, a boolean indicating
+// if it is an mmproj file, and a boolean indicating success.
+func (r *Registry) parseModel(path string, logger *slog.Logger) (Model, bool, bool) {
 	fi, err := os.Stat(path)
 	if err != nil {
 		logger.Warn("cannot stat model file", "path", path, "error", err)
-		return false
+		return Model{}, false, false
 	}
 
 	meta, err := parseGGUF(path)
 	if err != nil {
 		logger.Warn("cannot parse GGUF file", "path", path, "error", err)
-		return false
+		return Model{}, false, false
+	}
+
+	if meta.isMmproj {
+		return Model{}, true, true
 	}
 
 	arch := meta.architecture
@@ -151,7 +180,7 @@ func (r *Registry) addModel(path string, logger *slog.Logger) bool {
 			"path", path,
 			"missing_fields", strings.Join(missing, ", "),
 		)
-		return false
+		return Model{}, false, false
 	}
 
 	// Head dimension: prefer the direct field; fall back to embedding_length / head_count.
@@ -163,7 +192,7 @@ func (r *Registry) addModel(path string, logger *slog.Logger) bool {
 		logger.Warn("skipping model: cannot determine head dimension",
 			"path", path,
 		)
-		return false
+		return Model{}, false, false
 	}
 
 	base := filepath.Base(path)
@@ -184,10 +213,7 @@ func (r *Registry) addModel(path string, logger *slog.Logger) bool {
 		Quantization: fileTypeString(meta.fileType),
 	}
 
-	idx := len(r.models)
-	r.models = append(r.models, m)
-	r.byID[id] = idx
-	return true
+	return m, false, true
 }
 
 // fingerprint computes a stable uint64 ID for a model from its absolute path and file size.

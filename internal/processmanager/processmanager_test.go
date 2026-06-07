@@ -102,7 +102,7 @@ func TestLoad_Success(t *testing.T) {
 	m := newTestManager(t, "healthy")
 	ctx := context.Background()
 
-	rec, err := m.Load(ctx, 1, "/fake/model.gguf", 4096, 32)
+	rec, err := m.Load(ctx, 1, "/fake/model.gguf", "", 4096, 32)
 	if err != nil {
 		t.Fatalf("Load: unexpected error: %v", err)
 	}
@@ -143,11 +143,11 @@ func TestLoad_AlreadyLoaded_ReturnsSameRecord(t *testing.T) {
 	m := newTestManager(t, "healthy")
 	ctx := context.Background()
 
-	rec1, err := m.Load(ctx, 1, "/fake/model.gguf", 4096, 32)
+	rec1, err := m.Load(ctx, 1, "/fake/model.gguf", "", 4096, 32)
 	if err != nil {
 		t.Fatalf("first Load: %v", err)
 	}
-	rec2, err := m.Load(ctx, 1, "/fake/model.gguf", 4096, 32)
+	rec2, err := m.Load(ctx, 1, "/fake/model.gguf", "", 4096, 32)
 	if err != nil {
 		t.Fatalf("second Load: %v", err)
 	}
@@ -162,7 +162,7 @@ func TestLoad_Failure_SubprocessCrash(t *testing.T) {
 	m := newTestManager(t, "crash")
 	ctx := context.Background()
 
-	_, err := m.Load(ctx, 1, "/fake/model.gguf", 4096, 32)
+	_, err := m.Load(ctx, 1, "/fake/model.gguf", "", 4096, 32)
 	if err == nil {
 		t.Fatal("Load: expected error for crashing subprocess, got nil")
 	}
@@ -192,7 +192,7 @@ func TestLoad_ConcurrentSameModel_OneSubprocess(t *testing.T) {
 			defer done.Done()
 			ready.Done()
 			<-start
-			results[i], errs[i] = m.Load(ctx, 42, "/fake/model.gguf", 2048, 16)
+			results[i], errs[i] = m.Load(ctx, 42, "/fake/model.gguf", "", 2048, 16)
 		}()
 	}
 
@@ -222,7 +222,7 @@ func TestUnload_Clean(t *testing.T) {
 	m := newTestManager(t, "healthy")
 	ctx := context.Background()
 
-	rec, err := m.Load(ctx, 1, "/fake/model.gguf", 4096, 32)
+	rec, err := m.Load(ctx, 1, "/fake/model.gguf", "", 4096, 32)
 	if err != nil {
 		t.Fatalf("Load: %v", err)
 	}
@@ -258,7 +258,7 @@ func TestUnload_SIGKILLEscalation(t *testing.T) {
 	m := newTestManager(t, "hang")
 	ctx := context.Background()
 
-	if _, err := m.Load(ctx, 1, "/fake/model.gguf", 4096, 32); err != nil {
+	if _, err := m.Load(ctx, 1, "/fake/model.gguf", "", 4096, 32); err != nil {
 		t.Fatalf("Load: %v", err)
 	}
 
@@ -282,7 +282,7 @@ func TestCrash_MarksModelUnavailable(t *testing.T) {
 	m := newTestManager(t, "healthy")
 	ctx := context.Background()
 
-	rec, err := m.Load(ctx, 1, "/fake/model.gguf", 4096, 32)
+	rec, err := m.Load(ctx, 1, "/fake/model.gguf", "", 4096, 32)
 	if err != nil {
 		t.Fatalf("Load: %v", err)
 	}
@@ -324,7 +324,7 @@ func TestShutdown_RejectsNewLoad(t *testing.T) {
 
 	_ = m.UnloadAll(ctx)
 
-	if _, err := m.Load(ctx, 1, "/fake/model.gguf", 4096, 32); err == nil {
+	if _, err := m.Load(ctx, 1, "/fake/model.gguf", "", 4096, 32); err == nil {
 		t.Fatal("Load after UnloadAll: expected error, got nil")
 	}
 }
@@ -347,7 +347,7 @@ func TestLogCapture_SubprocessOutputForwarded(t *testing.T) {
 	}
 	ctx := context.Background()
 
-	if _, err := m.Load(ctx, 1, "/fake/model.gguf", 4096, 32); err != nil {
+	if _, err := m.Load(ctx, 1, "/fake/model.gguf", "", 4096, 32); err != nil {
 		t.Fatalf("Load: %v", err)
 	}
 	time.Sleep(100 * time.Millisecond)
@@ -374,7 +374,7 @@ func TestLoad_ExtraArgsAppended(t *testing.T) {
 	}
 
 	ctx := context.Background()
-	rec, err := m.Load(ctx, 1, "/fake/model.gguf", 4096, 32)
+	rec, err := m.Load(ctx, 1, "/fake/model.gguf", "", 4096, 32)
 	if err != nil {
 		t.Fatalf("Load: unexpected error: %v", err)
 	}

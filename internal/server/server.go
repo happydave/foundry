@@ -27,7 +27,7 @@ type modelRegistry interface {
 
 // processManager is the subset of processmanager.Manager used by the server.
 type processManager interface {
-	Load(ctx context.Context, modelID uint64, modelPath string, contextSize, gpuLayers int) (*processmanager.LoadedModel, error)
+	Load(ctx context.Context, modelID uint64, modelPath, mmprojPath string, contextSize, gpuLayers int) (*processmanager.LoadedModel, error)
 	Unload(ctx context.Context, modelID uint64) error
 	List() []*processmanager.LoadedModel
 	Get(modelID uint64) (*processmanager.LoadedModel, bool)
@@ -382,7 +382,7 @@ func (s *Server) handleLoadModel(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	lm, err := s.procMgr.Load(r.Context(), id, m.Path, ctxSize, s.defaultGPULayers)
+	lm, err := s.procMgr.Load(r.Context(), id, m.Path, m.MmprojPath, ctxSize, s.defaultGPULayers)
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, fmt.Sprintf("failed to load model: %v", err))
 		return

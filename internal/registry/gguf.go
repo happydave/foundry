@@ -177,6 +177,7 @@ type ggufMeta struct {
 	hasKVHeadCount  bool
 	hasMaxContext   bool
 	hasFileType     bool
+	isMmproj        bool
 }
 
 // parseGGUF reads the metadata section of the GGUF file at path and returns the fields
@@ -242,6 +243,9 @@ func applyMeta(meta *ggufMeta, key string, val any) {
 		if s, ok := val.(string); ok {
 			meta.architecture = s
 			meta.hasArchitecture = true
+			if s == "clip" {
+				meta.isMmproj = true
+			}
 		}
 	case "general.file_type":
 		if v, ok := toUint32(val); ok {

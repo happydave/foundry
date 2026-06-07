@@ -1,6 +1,6 @@
 # Foundry
 
-A local LLM inference service designed to run as a system daemon. Foundry manages one or more `llama-server` subprocesses — one per loaded model — and presents a unified OpenAI-compatible API over them.
+A local LLM inference service designed to run as a system daemon. Foundry manages one or more `llama-server` subprocesses — one per loaded model — and presents a unified inference API over them, supporting both the OpenAI and Anthropic wire formats.
 
 Foundry is for users who need reliable, scriptable model serving integrated into automation pipelines. It is not a GUI tool.
 
@@ -8,7 +8,7 @@ Foundry is for users who need reliable, scriptable model serving integrated into
 
 Foundry scans configured directories for GGUF model files at startup, populates a registry, and exposes two API surfaces on a single HTTP port:
 
-- **`/v1/`** — OpenAI-compatible inference endpoints. Any client that speaks the OpenAI API (IDE extensions, LiteLLM, curl) can target Foundry without modification.
+- **`/v1/`** — Inference endpoints. Supports the OpenAI wire format (`/v1/chat/completions`, `/v1/completions`) and the Anthropic wire format (`/v1/messages`). Any client that speaks either protocol can target Foundry without a translation shim.
 - **`/api/v1/`** — Management API. Load and unload models, query resource usage, and inspect service state.
 
 Each loaded model gets its own `llama-server` subprocess on a private loopback port. Foundry reverse-proxies inference requests to the right subprocess. A crashed subprocess marks that model unavailable but does not affect Foundry or other loaded models.
@@ -124,6 +124,32 @@ curl http://localhost:8080/v1/chat/completions \
 
 Same as above for legacy completions format.
 
+## Anthropic-compatible inference API
+
+### POST /v1/messages
+
+Anthropic Messages API. The `model` field must match a loaded model's display name. Both streaming and non-streaming responses are supported and passed through without buffering. Tool calling is supported via `llama-server`'s native Anthropic compatibility.
+
+```sh
+curl http://localhost:8080/v1/messages \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "llama-3.2-3b-instruct-q4_k_m",
+    "max_tokens": 1024,
+    "messages": [{"role": "user", "content": "Hello"}]
+  }'
+```
+
+**Error responses** use Anthropic error format (`type`, `error.type`, `error.message`):
+
+| Condition | Status |
+|---|---|
+| Model not in registry or not loaded | 404 (`not_found_error`) |
+| Model subprocess has crashed | 503 (`overloaded_error`) |
+| Invalid or missing `model` field | 400 (`invalid_request_error`) |
+
+Session history (`X-Foundry-Persist`) is not applied to `/v1/messages` requests.
+
 ### GET /v1/models
 
 Returns the list of currently loaded, healthy models in OpenAI list format.
@@ -215,4 +241,5 @@ go vet ./...
 | Resource estimator (VRAM estimation) | Implemented |
 | Management API | Implemented |
 | OpenAI-compatible inference proxy | Implemented |
+| Anthropic-compatible inference proxy (`/v1/messages`) | Implemented |
 | Session history store (JSONL backend) | Implemented |

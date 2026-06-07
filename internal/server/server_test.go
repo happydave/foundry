@@ -51,7 +51,7 @@ func newFakeProcMgr() *fakeProcMgr {
 	return &fakeProcMgr{loaded: make(map[uint64]*processmanager.LoadedModel)}
 }
 
-func (f *fakeProcMgr) Load(ctx context.Context, modelID uint64, modelPath string, contextSize, gpuLayers int) (*processmanager.LoadedModel, error) {
+func (f *fakeProcMgr) Load(ctx context.Context, modelID uint64, modelPath, mmprojPath string, contextSize, gpuLayers int) (*processmanager.LoadedModel, error) {
 	if f.loadFn != nil {
 		return f.loadFn(ctx, modelID, modelPath, contextSize, gpuLayers)
 	}
