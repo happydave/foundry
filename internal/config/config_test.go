@@ -48,7 +48,6 @@ func TestLoad_Defaults(t *testing.T) {
 	path := writeTemp(t, `
 model_scan_paths: [/models]
 llama_server_binary: /usr/bin/llama-server
-kv_cache_type: f16
 history_sessions_dir: /var/foundry/sessions
 `)
 	cfg, err := Load(path)
@@ -60,6 +59,9 @@ history_sessions_dir: /var/foundry/sessions
 	}
 	if cfg.LogLevel != "info" {
 		t.Errorf("LogLevel = %q, want info", cfg.LogLevel)
+	}
+	if cfg.KVCacheType != "q8_0" {
+		t.Errorf("KVCacheType = %q, want q8_0 (default)", cfg.KVCacheType)
 	}
 }
 
@@ -78,22 +80,17 @@ func TestLoad_MissingRequiredFields(t *testing.T) {
 	}{
 		{
 			name:    "missing model_scan_paths",
-			content: "llama_server_binary: /bin/llama\nkv_cache_type: f16\nhistory_sessions_dir: /s\n",
+			content: "llama_server_binary: /bin/llama\nhistory_sessions_dir: /s\n",
 			want:    "model_scan_paths",
 		},
 		{
 			name:    "missing llama_server_binary",
-			content: "model_scan_paths: [/m]\nkv_cache_type: f16\nhistory_sessions_dir: /s\n",
+			content: "model_scan_paths: [/m]\nhistory_sessions_dir: /s\n",
 			want:    "llama_server_binary",
 		},
 		{
-			name:    "missing kv_cache_type",
-			content: "model_scan_paths: [/m]\nllama_server_binary: /bin/llama\nhistory_sessions_dir: /s\n",
-			want:    "kv_cache_type",
-		},
-		{
 			name:    "missing history_sessions_dir",
-			content: "model_scan_paths: [/m]\nllama_server_binary: /bin/llama\nkv_cache_type: f16\n",
+			content: "model_scan_paths: [/m]\nllama_server_binary: /bin/llama\n",
 			want:    "history_sessions_dir",
 		},
 	}
@@ -111,6 +108,40 @@ func TestLoad_MissingRequiredFields(t *testing.T) {
 	}
 }
 
+func TestLoad_KVCacheType_Absent_DefaultsToQ8_0(t *testing.T) {
+	path := writeTemp(t, `
+model_scan_paths: [/m]
+llama_server_binary: /bin/llama
+history_sessions_dir: /s
+`)
+	cfg, err := Load(path)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if cfg.KVCacheType != "q8_0" {
+		t.Errorf("KVCacheType = %q, want q8_0 when absent", cfg.KVCacheType)
+	}
+}
+
+func TestLoad_KVCacheType_Invalid(t *testing.T) {
+	path := writeTemp(t, `
+model_scan_paths: [/m]
+llama_server_binary: /bin/llama
+history_sessions_dir: /s
+kv_cache_type: q4_0
+`)
+	_, err := Load(path)
+	if err == nil {
+		t.Fatal("expected error for unsupported kv_cache_type, got nil")
+	}
+	if got := err.Error(); !strings.Contains(got, "q4_0") {
+		t.Errorf("error %q does not mention the invalid value %q", got, "q4_0")
+	}
+	if got := err.Error(); !strings.Contains(got, "kv_cache_type") {
+		t.Errorf("error %q does not mention kv_cache_type", got)
+	}
+}
+
 func TestLoad_UnparsableYAML(t *testing.T) {
 	path := writeTemp(t, "this: is: not: valid: yaml: {{{{")
 	_, err := Load(path)
@@ -123,7 +154,6 @@ func TestLoad_ModelConfig_MutualExclusion(t *testing.T) {
 	path := writeTemp(t, `
 model_scan_paths: [/m]
 llama_server_binary: /bin/llama
-kv_cache_type: f16
 history_sessions_dir: /s
 models:
   my-model:
@@ -146,7 +176,6 @@ func TestLoad_ModelConfig_OnlyChatTemplate_Valid(t *testing.T) {
 	path := writeTemp(t, `
 model_scan_paths: [/m]
 llama_server_binary: /bin/llama
-kv_cache_type: f16
 history_sessions_dir: /s
 models:
   my-model:
@@ -169,7 +198,6 @@ func TestLoad_ModelConfig_OnlyChatTemplateFile_Valid(t *testing.T) {
 	path := writeTemp(t, `
 model_scan_paths: [/m]
 llama_server_binary: /bin/llama
-kv_cache_type: f16
 history_sessions_dir: /s
 models:
   my-model:
@@ -188,7 +216,6 @@ func TestLoad_ModelConfig_BothEmpty_Valid(t *testing.T) {
 	path := writeTemp(t, `
 model_scan_paths: [/m]
 llama_server_binary: /bin/llama
-kv_cache_type: f16
 history_sessions_dir: /s
 models:
   my-model:
@@ -205,7 +232,6 @@ func TestLoad_ModelConfig_UnknownField_Rejected(t *testing.T) {
 	path := writeTemp(t, `
 model_scan_paths: [/m]
 llama_server_binary: /bin/llama
-kv_cache_type: f16
 history_sessions_dir: /s
 models:
   my-model:
@@ -214,5 +240,48 @@ models:
 	_, err := Load(path)
 	if err == nil {
 		t.Fatal("expected error for unknown field in model config, got nil")
+	}
+}
+
+func TestLoad_ModelConfig_KVCacheType_Valid(t *testing.T) {
+	path := writeTemp(t, `
+model_scan_paths: [/m]
+llama_server_binary: /bin/llama
+history_sessions_dir: /s
+kv_cache_type: q8_0
+models:
+  my-model:
+    kv_cache_type: f16
+`)
+	cfg, err := Load(path)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if cfg.Models["my-model"].KVCacheType != "f16" {
+		t.Errorf("per-model KVCacheType = %q, want f16", cfg.Models["my-model"].KVCacheType)
+	}
+	if cfg.KVCacheType != "q8_0" {
+		t.Errorf("global KVCacheType = %q, want q8_0", cfg.KVCacheType)
+	}
+}
+
+func TestLoad_ModelConfig_KVCacheType_Invalid(t *testing.T) {
+	path := writeTemp(t, `
+model_scan_paths: [/m]
+llama_server_binary: /bin/llama
+history_sessions_dir: /s
+models:
+  my-model:
+    kv_cache_type: q4_0
+`)
+	_, err := Load(path)
+	if err == nil {
+		t.Fatal("expected error for unsupported per-model kv_cache_type, got nil")
+	}
+	if got := err.Error(); !strings.Contains(got, "my-model") {
+		t.Errorf("error %q does not identify the model name", got)
+	}
+	if got := err.Error(); !strings.Contains(got, "q4_0") {
+		t.Errorf("error %q does not mention the invalid value", got)
 	}
 }

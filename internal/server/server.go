@@ -27,7 +27,7 @@ type modelRegistry interface {
 
 // processManager is the subset of processmanager.Manager used by the server.
 type processManager interface {
-	Load(ctx context.Context, modelID uint64, modelPath, mmprojPath string, contextSize, gpuLayers int, perModelArgs []string) (*processmanager.LoadedModel, error)
+	Load(ctx context.Context, modelID uint64, modelPath, mmprojPath string, contextSize, gpuLayers int, opts processmanager.ModelLoadOptions) (*processmanager.LoadedModel, error)
 	Unload(ctx context.Context, modelID uint64) error
 	List() []*processmanager.LoadedModel
 	Get(modelID uint64) (*processmanager.LoadedModel, bool)
@@ -35,18 +35,23 @@ type processManager interface {
 
 // resourceEstimator is the subset of estimator.Estimator used by the server.
 type resourceEstimator interface {
-	Forward(model estimator.ModelSpec, ctxLen uint32, inUseBytes uint64) (estimator.ForwardResult, error)
-	Inverse(model estimator.ModelSpec, inUseBytes uint64) (estimator.InverseResult, error)
+	Forward(model estimator.ModelSpec, ctxLen uint32, inUseBytes uint64, kvType string) (estimator.ForwardResult, error)
+	Inverse(model estimator.ModelSpec, inUseBytes uint64, kvType string) (estimator.InverseResult, error)
 }
 
 type Server struct {
-	http             *http.Server
-	registry         modelRegistry
-	procMgr          processManager
-	estimator        resourceEstimator
-	defaultGPULayers int
-	perModelArgs     map[string][]string // keyed by DisplayName; absent entry means no per-model args
-	logger           *slog.Logger
+	http              *http.Server
+	registry          modelRegistry
+	procMgr           processManager
+	estimator         resourceEstimator
+	defaultGPULayers  int
+	globalKVCacheType string
+	// resolvedModelOpts maps DisplayName to pre-resolved per-model load options
+	// (KV cache type already resolved against the global default, Args populated
+	// from chat-template config). Models absent from the map use globalKVCacheType
+	// and no extra args.
+	resolvedModelOpts map[string]processmanager.ModelLoadOptions
+	logger            *slog.Logger
 
 	// inferenceHook, if set, is called before each inference request is proxied.
 	inferenceHook InferenceHook
@@ -59,8 +64,18 @@ type Server struct {
 	queryVRAMTotal func() (uint64, error)
 }
 
-func New(addr string, reg *registry.Registry, pm *processmanager.Manager, est *estimator.Estimator, defaultGPULayers int, perModelArgs map[string][]string, logger *slog.Logger) *Server {
-	return newServer(addr, reg, pm, est, defaultGPULayers, perModelArgs, logger)
+func New(addr string, reg *registry.Registry, pm *processmanager.Manager, est *estimator.Estimator, defaultGPULayers int, globalKVCacheType string, resolvedModelOpts map[string]processmanager.ModelLoadOptions, logger *slog.Logger) *Server {
+	return newServer(addr, reg, pm, est, defaultGPULayers, globalKVCacheType, resolvedModelOpts, logger)
+}
+
+// resolveOpts returns the ModelLoadOptions for the given model DisplayName.
+// Models not in resolvedModelOpts fall back to an options value carrying only
+// the global KV cache type.
+func (s *Server) resolveOpts(displayName string) processmanager.ModelLoadOptions {
+	if opts, ok := s.resolvedModelOpts[displayName]; ok {
+		return opts
+	}
+	return processmanager.ModelLoadOptions{KVCacheType: s.globalKVCacheType}
 }
 
 // SetHistoryStore attaches a history store to the server, enabling persistent
@@ -69,16 +84,17 @@ func (s *Server) SetHistoryStore(store history.Store) {
 	s.historyStore = store
 }
 
-func newServer(addr string, reg modelRegistry, pm processManager, est resourceEstimator, defaultGPULayers int, perModelArgs map[string][]string, logger *slog.Logger) *Server {
+func newServer(addr string, reg modelRegistry, pm processManager, est resourceEstimator, defaultGPULayers int, globalKVCacheType string, resolvedModelOpts map[string]processmanager.ModelLoadOptions, logger *slog.Logger) *Server {
 	s := &Server{
-		registry:         reg,
-		procMgr:          pm,
-		estimator:        est,
-		defaultGPULayers: defaultGPULayers,
-		perModelArgs:     perModelArgs,
-		logger:           logger,
-		queryResources:   estimator.QueryResources,
-		queryVRAMTotal:   estimator.QueryVRAMTotal,
+		registry:          reg,
+		procMgr:           pm,
+		estimator:         est,
+		defaultGPULayers:  defaultGPULayers,
+		globalKVCacheType: globalKVCacheType,
+		resolvedModelOpts: resolvedModelOpts,
+		logger:            logger,
+		queryResources:    estimator.QueryResources,
+		queryVRAMTotal:    estimator.QueryVRAMTotal,
 	}
 
 	mux := http.NewServeMux()
@@ -293,14 +309,15 @@ func (s *Server) handleGetModel(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	kvType := s.resolveOpts(m.DisplayName).KVCacheType
 	spec := modelSpec(m)
-	fwd, err := s.estimator.Forward(spec, m.MaxContext, 0)
+	fwd, err := s.estimator.Forward(spec, m.MaxContext, 0, kvType)
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, fmt.Sprintf("resource estimation failed: %v", err))
 		return
 	}
 
-	inv, err := s.estimator.Inverse(spec, 0)
+	inv, err := s.estimator.Inverse(spec, 0, kvType)
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, fmt.Sprintf("resource estimation failed: %v", err))
 		return
@@ -353,11 +370,12 @@ func (s *Server) handleLoadModel(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
+	opts := s.resolveOpts(m.DisplayName)
 	spec := modelSpec(m)
 
 	ctxSize := req.Ctx
 	if ctxSize <= 0 {
-		inv, err := s.estimator.Inverse(spec, 0)
+		inv, err := s.estimator.Inverse(spec, 0, opts.KVCacheType)
 		if err != nil {
 			writeError(w, http.StatusInternalServerError, fmt.Sprintf("resource estimation failed: %v", err))
 			return
@@ -372,7 +390,7 @@ func (s *Server) handleLoadModel(w http.ResponseWriter, r *http.Request) {
 		if m.MaxContext > 0 && ctxSize > int(m.MaxContext) {
 			ctxSize = int(m.MaxContext)
 		}
-		fwd, err := s.estimator.Forward(spec, uint32(ctxSize), 0)
+		fwd, err := s.estimator.Forward(spec, uint32(ctxSize), 0, opts.KVCacheType)
 		if err != nil {
 			writeError(w, http.StatusInternalServerError, fmt.Sprintf("resource estimation failed: %v", err))
 			return
@@ -384,7 +402,7 @@ func (s *Server) handleLoadModel(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	lm, err := s.procMgr.Load(r.Context(), id, m.Path, m.MmprojPath, ctxSize, s.defaultGPULayers, s.perModelArgs[m.DisplayName])
+	lm, err := s.procMgr.Load(r.Context(), id, m.Path, m.MmprojPath, ctxSize, s.defaultGPULayers, opts)
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, fmt.Sprintf("failed to load model: %v", err))
 		return
@@ -439,8 +457,9 @@ func (s *Server) handleEstimate(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	kvType := s.resolveOpts(m.DisplayName).KVCacheType
 	spec := modelSpec(m)
-	fwd, err := s.estimator.Forward(spec, uint32(ctxVal), 0)
+	fwd, err := s.estimator.Forward(spec, uint32(ctxVal), 0, kvType)
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, fmt.Sprintf("resource estimation failed: %v", err))
 		return

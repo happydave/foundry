@@ -17,6 +17,12 @@ import (
 	"github.com/happydave/foundry/internal/server"
 )
 
+// knownLlamaServerVersions lists the llama-server --version substrings accepted
+// at startup. Add new entries here when upgrading the binary.
+var knownLlamaServerVersions = []string{
+	"version: 9536 (308f61c31)",
+}
+
 func main() {
 	configPath := flag.String("config", "foundry.yaml", "path to YAML config file")
 	flag.Parse()
@@ -36,23 +42,34 @@ func main() {
 
 	logger.Info("foundry starting", "listen_address", cfg.ListenAddress, "log_level", cfg.LogLevel)
 
+	if err := processmanager.CheckBinaryVersion(cfg.LlamaServerBinary, knownLlamaServerVersions); err != nil {
+		logger.Error("llama-server version check failed", "error", err.Error())
+		os.Exit(1)
+	}
+
 	reg := registry.New(cfg.ModelScanPaths, logger)
 	pm := processmanager.New(cfg.LlamaServerBinary, cfg.LlamaServerExtraArgs, logger)
-	est := estimator.New(estimator.Params{KVCacheType: cfg.KVCacheType})
+	est := estimator.New(estimator.Params{})
 
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGTERM, os.Interrupt)
 	defer stop()
 
-	perModelArgs := make(map[string][]string, len(cfg.Models))
+	resolvedOpts := make(map[string]processmanager.ModelLoadOptions, len(cfg.Models))
 	for name, mc := range cfg.Models {
-		if f := strings.TrimSpace(mc.ChatTemplateFile); f != "" {
-			perModelArgs[name] = []string{"--chat-template-file", f}
-		} else if t := strings.TrimSpace(mc.ChatTemplate); t != "" {
-			perModelArgs[name] = []string{"--chat-template", t}
+		kvType := mc.KVCacheType
+		if kvType == "" {
+			kvType = cfg.KVCacheType
 		}
+		opts := processmanager.ModelLoadOptions{KVCacheType: kvType}
+		if f := strings.TrimSpace(mc.ChatTemplateFile); f != "" {
+			opts.Args = []string{"--chat-template-file", f}
+		} else if t := strings.TrimSpace(mc.ChatTemplate); t != "" {
+			opts.Args = []string{"--chat-template", t}
+		}
+		resolvedOpts[name] = opts
 	}
 
-	srv := server.New(cfg.ListenAddress, reg, pm, est, cfg.DefaultGPULayers, perModelArgs, logger)
+	srv := server.New(cfg.ListenAddress, reg, pm, est, cfg.DefaultGPULayers, cfg.KVCacheType, resolvedOpts, logger)
 
 	if fi, err := os.Stat(cfg.HistorySessionsDir); err != nil || !fi.IsDir() {
 		logger.Warn("history_sessions_dir does not exist or is not a directory; persistent session history is disabled",

@@ -11,6 +11,7 @@ import (
 	"net/http"
 	"os/exec"
 	"strconv"
+	"strings"
 	"sync"
 	"syscall"
 	"time"
@@ -85,17 +86,63 @@ type procHandle struct {
 	waitErr  error         // set before waitDone is closed
 }
 
+// ModelLoadOptions holds per-model options for a single Manager.Load call.
+// Replacing the former perModelArgs []string parameter, this struct is the
+// extension point for future per-model load configuration.
+type ModelLoadOptions struct {
+	// Args are appended to the subprocess command line after the cache-type
+	// flags and before the manager's global extra args (e.g. --chat-template-file).
+	Args []string
+	// KVCacheType is the resolved KV cache element type for this model
+	// (e.g. "f16", "q8_0"). If empty, doLoad treats it as "q8_0".
+	KVCacheType string
+}
+
+// CheckBinaryVersion runs binary --version, captures the combined stdout+stderr
+// output, and checks whether the output contains any entry in allowedVersions as
+// a substring. The process exit code is ignored — some llama.cpp builds exit
+// non-zero for --version while still emitting recognisable output.
+//
+// Returns an error if the binary cannot be executed, if the output is empty, or
+// if none of the allowedVersions strings appear in the output.
+func CheckBinaryVersion(binary string, allowedVersions []string) error {
+	return checkBinaryVersionWithCmd(binary, allowedVersions, exec.Command)
+}
+
+// checkBinaryVersionWithCmd is the injectable implementation used by
+// CheckBinaryVersion and tests.
+func checkBinaryVersionWithCmd(binary string, allowedVersions []string, newCmd func(string, ...string) *exec.Cmd) error {
+	cmd := newCmd(binary, "--version")
+	out, err := cmd.CombinedOutput()
+	if err != nil && len(out) == 0 {
+		return fmt.Errorf("failed to run %q --version: %w", binary, err)
+	}
+	combined := string(out)
+	if strings.TrimSpace(combined) == "" {
+		return fmt.Errorf("llama-server --version produced no output; cannot verify version")
+	}
+	for _, v := range allowedVersions {
+		if strings.Contains(combined, v) {
+			return nil
+		}
+	}
+	return fmt.Errorf("llama-server version not recognised: got %q; known-good versions: %v",
+		strings.TrimSpace(combined), allowedVersions)
+}
+
 // Manager launches and terminates llama-server subprocesses, one per loaded model.
 // It serialises concurrent load requests for the same model and isolates subprocess
 // crashes so they do not affect Foundry or other loaded models.
 //
 // llama-server flags assumed (verify against the binary in use):
 //
-//	--model <path>         model file path
-//	--ctx-size <n>         context window size
-//	--n-gpu-layers <n>     number of layers to offload to GPU
-//	--port <n>             TCP port to listen on
-//	--host 127.0.0.1       bind to loopback only
+//	--model <path>              model file path
+//	--ctx-size <n>              context window size
+//	--n-gpu-layers <n>          number of layers to offload to GPU
+//	--port <n>                  TCP port to listen on
+//	--host 127.0.0.1            bind to loopback only
+//	--cache-type-k <type>       KV cache key element type
+//	--cache-type-v <type>       KV cache value element type
 //
 // Health endpoint assumed: GET /health returns 200 OK when ready for inference.
 type Manager struct {
@@ -125,13 +172,13 @@ func New(binary string, extraArgs []string, logger *slog.Logger) *Manager {
 }
 
 // Load launches a llama-server subprocess for the model, polls its health endpoint
-// until ready, and returns the loaded model record. perModelArgs are appended after
-// the standard model flags and before the manager's global extraArgs. Pass nil for
-// no per-model args. Behaviour for concurrent calls:
+// until ready, and returns the loaded model record. opts carries per-model options
+// including the resolved KV cache type and any extra args. Behaviour for concurrent
+// calls:
 //   - Already loaded: returns the existing record immediately (no new subprocess).
 //   - Load in progress: blocks until complete and returns the same outcome.
 //   - Load failed previously: starts a fresh load attempt.
-func (m *Manager) Load(ctx context.Context, modelID uint64, modelPath, mmprojPath string, contextSize, gpuLayers int, perModelArgs []string) (*LoadedModel, error) {
+func (m *Manager) Load(ctx context.Context, modelID uint64, modelPath, mmprojPath string, contextSize, gpuLayers int, opts ModelLoadOptions) (*LoadedModel, error) {
 	m.mu.Lock()
 
 	if m.closing {
@@ -155,7 +202,7 @@ func (m *Manager) Load(ctx context.Context, modelID uint64, modelPath, mmprojPat
 				return nil, ctx.Err()
 			}
 			// Re-enter after the in-progress operation completes.
-			return m.Load(ctx, modelID, modelPath, mmprojPath, contextSize, gpuLayers, perModelArgs)
+			return m.Load(ctx, modelID, modelPath, mmprojPath, contextSize, gpuLayers, opts)
 
 		case kindFailed:
 			// Previous attempt failed; allow retry by falling through.
@@ -167,7 +214,7 @@ func (m *Manager) Load(ctx context.Context, modelID uint64, modelPath, mmprojPat
 	m.models[modelID] = e
 	m.mu.Unlock()
 
-	record, cmd, ph, loadErr := m.doLoad(ctx, modelID, modelPath, mmprojPath, contextSize, gpuLayers, perModelArgs)
+	record, cmd, ph, loadErr := m.doLoad(ctx, modelID, modelPath, mmprojPath, contextSize, gpuLayers, opts)
 
 	m.mu.Lock()
 	if loadErr != nil {
@@ -191,10 +238,15 @@ func (m *Manager) Load(ctx context.Context, modelID uint64, modelPath, mmprojPat
 }
 
 // doLoad performs the actual subprocess launch, I/O wiring, and health polling.
-func (m *Manager) doLoad(ctx context.Context, modelID uint64, modelPath, mmprojPath string, contextSize, gpuLayers int, perModelArgs []string) (*LoadedModel, *exec.Cmd, *procHandle, error) {
+func (m *Manager) doLoad(ctx context.Context, modelID uint64, modelPath, mmprojPath string, contextSize, gpuLayers int, opts ModelLoadOptions) (*LoadedModel, *exec.Cmd, *procHandle, error) {
 	port, err := freePort()
 	if err != nil {
 		return nil, nil, nil, fmt.Errorf("model %d: no free port: %w", modelID, err)
+	}
+
+	kvType := opts.KVCacheType
+	if kvType == "" {
+		kvType = "q8_0"
 	}
 
 	args := []string{
@@ -203,11 +255,13 @@ func (m *Manager) doLoad(ctx context.Context, modelID uint64, modelPath, mmprojP
 		"--n-gpu-layers", strconv.Itoa(gpuLayers),
 		"--port", strconv.Itoa(port),
 		"--host", "127.0.0.1",
+		"--cache-type-k", kvType,
+		"--cache-type-v", kvType,
 	}
 	if mmprojPath != "" {
 		args = append(args, "--mmproj", mmprojPath)
 	}
-	args = append(args, perModelArgs...)
+	args = append(args, opts.Args...)
 	args = append(args, m.extraArgs...)
 	cmd := m.newCmd(m.binary, args...)
 

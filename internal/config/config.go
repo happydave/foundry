@@ -9,11 +9,20 @@ import (
 	"gopkg.in/yaml.v3"
 )
 
+// validKVCacheTypes lists the supported KV cache element types.
+var validKVCacheTypes = map[string]bool{
+	"f16":  true,
+	"bf16": true,
+	"f32":  true,
+	"q8_0": true,
+}
+
 // ModelConfig holds per-model overrides. Keys in the top-level Models map are
 // model DisplayNames (GGUF filename without the .gguf extension).
 type ModelConfig struct {
 	ChatTemplate     string `yaml:"chat_template"`
 	ChatTemplateFile string `yaml:"chat_template_file"`
+	KVCacheType      string `yaml:"kv_cache_type"`
 }
 
 type Config struct {
@@ -52,6 +61,9 @@ func Load(path string) (*Config, error) {
 	if cfg.LogLevel == "" {
 		cfg.LogLevel = "info"
 	}
+	if cfg.KVCacheType == "" {
+		cfg.KVCacheType = "q8_0"
+	}
 
 	return &cfg, nil
 }
@@ -64,15 +76,18 @@ func (c *Config) validate() error {
 	if c.LlamaServerBinary == "" {
 		errs = append(errs, errors.New("llama_server_binary is required"))
 	}
-	if c.KVCacheType == "" {
-		errs = append(errs, errors.New("kv_cache_type is required"))
-	}
 	if c.HistorySessionsDir == "" {
 		errs = append(errs, errors.New("history_sessions_dir is required"))
+	}
+	if c.KVCacheType != "" && !validKVCacheTypes[c.KVCacheType] {
+		errs = append(errs, fmt.Errorf("kv_cache_type %q is not supported; must be one of: f16, bf16, f32, q8_0", c.KVCacheType))
 	}
 	for name, mc := range c.Models {
 		if strings.TrimSpace(mc.ChatTemplate) != "" && strings.TrimSpace(mc.ChatTemplateFile) != "" {
 			errs = append(errs, fmt.Errorf("model %q: chat_template and chat_template_file are mutually exclusive", name))
+		}
+		if mc.KVCacheType != "" && !validKVCacheTypes[mc.KVCacheType] {
+			errs = append(errs, fmt.Errorf("model %q: kv_cache_type %q is not supported; must be one of: f16, bf16, f32, q8_0", name, mc.KVCacheType))
 		}
 	}
 	return errors.Join(errs...)

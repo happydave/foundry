@@ -13,13 +13,10 @@ import (
 // likelihood of OOM at actual load time.
 const headroomFactor = 1.15
 
-// Params configures estimation behavior.
-type Params struct {
-	// KVCacheType is the element type for the KV cache.
-	// Supported values: "f16" (default), "bf16", "f32", "q8_0".
-	// An empty string or unrecognised value defaults to f16 (2 bytes/element).
-	KVCacheType string
-}
+// Params configures estimation behavior. KVCacheType has been moved to a
+// per-call parameter on Forward and Inverse; this struct is retained as an
+// extension point for future global parameters.
+type Params struct{}
 
 // ModelSpec holds the model fields required for estimation.
 type ModelSpec struct {
@@ -61,6 +58,8 @@ func New(params Params) *Estimator {
 
 // Forward estimates the memory cost for loading model at ctxLen tokens and
 // returns a feasibility verdict against currently available resources.
+// kvType is the KV cache element type (e.g. "f16", "q8_0"); unrecognised or
+// empty values default to f16.
 //
 // inUseBytes is the total VRAM currently consumed by loaded llama-server
 // instances. The caller (Process Manager) is responsible for providing this
@@ -68,7 +67,7 @@ func New(params Params) *Estimator {
 //
 // If ctxLen exceeds the model's native MaxContext, it is clamped to
 // MaxContext before estimation proceeds.
-func (e *Estimator) Forward(model ModelSpec, ctxLen uint32, inUseBytes uint64) (ForwardResult, error) {
+func (e *Estimator) Forward(model ModelSpec, ctxLen uint32, inUseBytes uint64, kvType string) (ForwardResult, error) {
 	if ctxLen == 0 {
 		return ForwardResult{}, errors.New("context size must be positive")
 	}
@@ -90,7 +89,7 @@ func (e *Estimator) Forward(model ModelSpec, ctxLen uint32, inUseBytes uint64) (
 	}
 
 	weightCost := uint64(model.FileSize)
-	kvCost := kvCacheBytes(model, ctxLen, e.kvBytesPerElement())
+	kvCost := kvCacheBytes(model, ctxLen, kvBytesPerElement(kvType))
 	totalCost := weightCost + kvCost
 
 	budget := effectiveBudget(vramAvail, ramAvail, inUseBytes)
@@ -106,13 +105,15 @@ func (e *Estimator) Forward(model ModelSpec, ctxLen uint32, inUseBytes uint64) (
 
 // Inverse computes the largest context size that fits in available resources
 // for the given model.
+// kvType is the KV cache element type (e.g. "f16", "q8_0"); unrecognised or
+// empty values default to f16.
 //
 // inUseBytes is the total VRAM currently consumed by loaded llama-server
 // instances.
 //
 // Returns MaxContext=0 if the model's weights alone exceed the effective memory
 // budget (model does not fit at any context size).
-func (e *Estimator) Inverse(model ModelSpec, inUseBytes uint64) (InverseResult, error) {
+func (e *Estimator) Inverse(model ModelSpec, inUseBytes uint64, kvType string) (InverseResult, error) {
 	if model.KVHeadCount == 0 {
 		return InverseResult{}, errors.New("model KV head count must be positive")
 	}
@@ -135,7 +136,7 @@ func (e *Estimator) Inverse(model ModelSpec, inUseBytes uint64) (InverseResult, 
 	}
 
 	kvBudget := conservativeBudget - weightCost
-	bytesPerCtx := kvCacheBytesPerToken(model, e.kvBytesPerElement())
+	bytesPerCtx := kvCacheBytesPerToken(model, kvBytesPerElement(kvType))
 	if bytesPerCtx == 0 {
 		return InverseResult{}, errors.New("KV cache cost per token is zero; cannot compute inverse")
 	}
@@ -153,32 +154,35 @@ func (e *Estimator) Inverse(model ModelSpec, inUseBytes uint64) (InverseResult, 
 	return InverseResult{MaxContext: uint32(maxCtx)}, nil
 }
 
-// kvBytesPerElement returns bytes per KV cache element for the configured type.
-func (e *Estimator) kvBytesPerElement() uint64 {
-	switch strings.ToLower(e.params.KVCacheType) {
+// kvBytesPerElement returns bytes per KV cache element for the given type.
+// q8_0 uses 34 bytes per 32 elements (block_q8_0: 2-byte delta + 32 int8 values).
+// Unrecognised or empty values conservatively default to f16 (2 bytes/element).
+func kvBytesPerElement(kvType string) float64 {
+	switch strings.ToLower(kvType) {
 	case "f32":
-		return 4
+		return 4.0
 	case "q8_0":
-		return 1
+		return 34.0 / 32.0
 	case "f16", "bf16", "":
-		return 2
+		return 2.0
 	default:
-		// Unknown type: conservatively default to f16 (2 bytes).
-		return 2
+		return 2.0
 	}
 }
 
 // kvCacheBytes computes the KV cache cost in bytes for a given context length.
 // Formula: layers × kv_heads × head_dim × ctx_len × bytes_per_element × 2
 // The factor of 2 accounts for both key and value caches.
-func kvCacheBytes(model ModelSpec, ctxLen uint32, bytesPerElem uint64) uint64 {
-	return uint64(model.LayerCount) * uint64(model.KVHeadCount) * uint64(model.HeadDim) * uint64(ctxLen) * bytesPerElem * 2
+func kvCacheBytes(model ModelSpec, ctxLen uint32, bytesPerElem float64) uint64 {
+	count := uint64(model.LayerCount) * uint64(model.KVHeadCount) * uint64(model.HeadDim) * uint64(ctxLen) * 2
+	return uint64(float64(count) * bytesPerElem)
 }
 
 // kvCacheBytesPerToken returns the KV cache cost in bytes for a single token.
 // This is used by Inverse to solve for the maximum context size.
-func kvCacheBytesPerToken(model ModelSpec, bytesPerElem uint64) uint64 {
-	return uint64(model.LayerCount) * uint64(model.KVHeadCount) * uint64(model.HeadDim) * bytesPerElem * 2
+func kvCacheBytesPerToken(model ModelSpec, bytesPerElem float64) uint64 {
+	count := uint64(model.LayerCount) * uint64(model.KVHeadCount) * uint64(model.HeadDim) * 2
+	return uint64(float64(count) * bytesPerElem)
 }
 
 // effectiveBudget computes the total available memory budget after subtracting

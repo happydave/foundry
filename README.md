@@ -16,7 +16,7 @@ Each loaded model gets its own `llama-server` subprocess on a private loopback p
 ## Prerequisites
 
 - Go 1.22 or later
-- A `llama-server` binary (from [llama.cpp](https://github.com/ggerganov/llama.cpp))
+- A `llama-server` binary (from [llama.cpp](https://github.com/ggerganov/llama.cpp)) at a version recognized by Foundry. Foundry validates the binary version at startup and refuses to start if the installed binary is not on the known-good allowlist. The allowlist is defined in `cmd/foundry/main.go` (`knownLlamaServerVersions`).
 - One or more GGUF model files
 
 ## Build
@@ -40,8 +40,8 @@ llama_server_binary: /usr/local/bin/llama-server
 # Number of model layers to offload to GPU (required; use 0 for CPU-only)
 default_gpu_layers: 99
 
-# KV cache element type: f16, q8_0, q4_0, etc. (required)
-kv_cache_type: f16
+# KV cache element type for all models: f16, bf16, f32, q8_0 (optional; default: q8_0)
+kv_cache_type: q8_0
 
 # Directory for persistent session history files (required).
 # If the directory does not exist at startup, session history is disabled with a warning.
@@ -62,6 +62,9 @@ log_level: info
 # Each entry is optional. Unknown fields are rejected at startup.
 # models:
 #   my-model-name:
+#     # Override the global kv_cache_type for this model only (same values: f16, bf16, f32, q8_0).
+#     # kv_cache_type: f16
+#
 #     # Override the Jinja2 chat template embedded in the model's GGUF.
 #     # Use chat_template_file to supply the template from a file (recommended for
 #     # multi-line templates), or chat_template for a short inline string.

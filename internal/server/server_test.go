@@ -45,16 +45,16 @@ func (f *fakeRegistry) GetByName(name string) (registry.Model, bool) {
 type fakeProcMgr struct {
 	loaded map[uint64]*processmanager.LoadedModel
 	loadFn func(ctx context.Context, id uint64, path string, ctxSize, gpu int) (*processmanager.LoadedModel, error)
-	// lastPerModelArgs records the perModelArgs passed to the most recent Load call.
-	lastPerModelArgs []string
+	// lastOpts records the ModelLoadOptions passed to the most recent Load call.
+	lastOpts processmanager.ModelLoadOptions
 }
 
 func newFakeProcMgr() *fakeProcMgr {
 	return &fakeProcMgr{loaded: make(map[uint64]*processmanager.LoadedModel)}
 }
 
-func (f *fakeProcMgr) Load(ctx context.Context, modelID uint64, modelPath, mmprojPath string, contextSize, gpuLayers int, perModelArgs []string) (*processmanager.LoadedModel, error) {
-	f.lastPerModelArgs = perModelArgs
+func (f *fakeProcMgr) Load(ctx context.Context, modelID uint64, modelPath, mmprojPath string, contextSize, gpuLayers int, opts processmanager.ModelLoadOptions) (*processmanager.LoadedModel, error) {
+	f.lastOpts = opts
 	if f.loadFn != nil {
 		return f.loadFn(ctx, modelID, modelPath, contextSize, gpuLayers)
 	}
@@ -92,20 +92,20 @@ func (f *fakeProcMgr) Get(modelID uint64) (*processmanager.LoadedModel, bool) {
 }
 
 type fakeEstimator struct {
-	forwardFn func(model estimator.ModelSpec, ctxLen uint32, inUse uint64) (estimator.ForwardResult, error)
-	inverseFn func(model estimator.ModelSpec, inUse uint64) (estimator.InverseResult, error)
+	forwardFn func(model estimator.ModelSpec, ctxLen uint32, inUse uint64, kvType string) (estimator.ForwardResult, error)
+	inverseFn func(model estimator.ModelSpec, inUse uint64, kvType string) (estimator.InverseResult, error)
 }
 
-func (f *fakeEstimator) Forward(model estimator.ModelSpec, ctxLen uint32, inUse uint64) (estimator.ForwardResult, error) {
+func (f *fakeEstimator) Forward(model estimator.ModelSpec, ctxLen uint32, inUse uint64, kvType string) (estimator.ForwardResult, error) {
 	if f.forwardFn != nil {
-		return f.forwardFn(model, ctxLen, inUse)
+		return f.forwardFn(model, ctxLen, inUse, kvType)
 	}
 	return estimator.ForwardResult{TotalCost: 1 << 30, Feasible: true}, nil
 }
 
-func (f *fakeEstimator) Inverse(model estimator.ModelSpec, inUse uint64) (estimator.InverseResult, error) {
+func (f *fakeEstimator) Inverse(model estimator.ModelSpec, inUse uint64, kvType string) (estimator.InverseResult, error) {
 	if f.inverseFn != nil {
-		return f.inverseFn(model, inUse)
+		return f.inverseFn(model, inUse, kvType)
 	}
 	return estimator.InverseResult{MaxContext: 4096}, nil
 }
@@ -126,7 +126,7 @@ func newFixture(t *testing.T) *serverFixture {
 	pm := newFakeProcMgr()
 	est := &fakeEstimator{}
 
-	s := newServer("127.0.0.1:0", reg, pm, est, 35, nil, nil)
+	s := newServer("127.0.0.1:0", reg, pm, est, 35, "q8_0", nil, nil)
 	s.queryResources = func() (uint64, uint64, error) { return 8 << 30, 8 << 30, nil }
 	s.queryVRAMTotal = func() (uint64, error) { return 16 << 30, nil }
 
@@ -373,7 +373,7 @@ func TestLoadModel_InfeasibleContext_Returns422(t *testing.T) {
 	f := newFixture(t)
 	m := testModel(1)
 	f.reg.models = []registry.Model{m}
-	f.est.forwardFn = func(_ estimator.ModelSpec, _ uint32, _ uint64) (estimator.ForwardResult, error) {
+	f.est.forwardFn = func(_ estimator.ModelSpec, _ uint32, _ uint64, _ string) (estimator.ForwardResult, error) {
 		return estimator.ForwardResult{TotalCost: 100 << 30, Feasible: false}, nil
 	}
 
@@ -386,7 +386,7 @@ func TestLoadModel_NoMemory_Returns422(t *testing.T) {
 	f := newFixture(t)
 	m := testModel(1)
 	f.reg.models = []registry.Model{m}
-	f.est.inverseFn = func(_ estimator.ModelSpec, _ uint64) (estimator.InverseResult, error) {
+	f.est.inverseFn = func(_ estimator.ModelSpec, _ uint64, _ string) (estimator.InverseResult, error) {
 		return estimator.InverseResult{MaxContext: 0}, nil
 	}
 
@@ -439,8 +439,8 @@ func TestLoadModel_PerModelArgs_Threaded(t *testing.T) {
 	f := newFixture(t)
 	m := testModel(1)
 	f.reg.models = []registry.Model{m}
-	f.srv.perModelArgs = map[string][]string{
-		"test-model": {"--chat-template-file", "/path/to/template.jinja"},
+	f.srv.resolvedModelOpts = map[string]processmanager.ModelLoadOptions{
+		"test-model": {Args: []string{"--chat-template-file", "/path/to/template.jinja"}, KVCacheType: "q8_0"},
 	}
 
 	resp := f.do(t, http.MethodPost, "/api/v1/models/1/load", nil)
@@ -448,28 +448,28 @@ func TestLoadModel_PerModelArgs_Threaded(t *testing.T) {
 	_ = resp.Body.Close()
 
 	want := []string{"--chat-template-file", "/path/to/template.jinja"}
-	if len(f.pm.lastPerModelArgs) != len(want) {
-		t.Fatalf("perModelArgs = %v, want %v", f.pm.lastPerModelArgs, want)
+	if len(f.pm.lastOpts.Args) != len(want) {
+		t.Fatalf("opts.Args = %v, want %v", f.pm.lastOpts.Args, want)
 	}
 	for i, v := range want {
-		if f.pm.lastPerModelArgs[i] != v {
-			t.Errorf("perModelArgs[%d] = %q, want %q", i, f.pm.lastPerModelArgs[i], v)
+		if f.pm.lastOpts.Args[i] != v {
+			t.Errorf("opts.Args[%d] = %q, want %q", i, f.pm.lastOpts.Args[i], v)
 		}
 	}
 }
 
-func TestLoadModel_NoPerModelArgs_NilPassed(t *testing.T) {
+func TestLoadModel_NoPerModelArgs_NilArgs(t *testing.T) {
 	f := newFixture(t)
 	m := testModel(1)
 	f.reg.models = []registry.Model{m}
-	// perModelArgs map is nil — no config for any model
+	// resolvedModelOpts is nil — model has no explicit config
 
 	resp := f.do(t, http.MethodPost, "/api/v1/models/1/load", nil)
 	assertStatus(t, resp, http.StatusOK)
 	_ = resp.Body.Close()
 
-	if f.pm.lastPerModelArgs != nil {
-		t.Errorf("expected nil perModelArgs for model with no config, got %v", f.pm.lastPerModelArgs)
+	if f.pm.lastOpts.Args != nil {
+		t.Errorf("expected nil Args for model with no config, got %v", f.pm.lastOpts.Args)
 	}
 }
 
@@ -568,7 +568,7 @@ func TestEstimate_Valid(t *testing.T) {
 	f := newFixture(t)
 	m := testModel(1)
 	f.reg.models = []registry.Model{m}
-	f.est.forwardFn = func(_ estimator.ModelSpec, ctxLen uint32, _ uint64) (estimator.ForwardResult, error) {
+	f.est.forwardFn = func(_ estimator.ModelSpec, ctxLen uint32, _ uint64, _ string) (estimator.ForwardResult, error) {
 		return estimator.ForwardResult{TotalCost: uint64(ctxLen) * 1024, Feasible: true}, nil
 	}
 
