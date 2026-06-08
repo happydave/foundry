@@ -125,11 +125,13 @@ func New(binary string, extraArgs []string, logger *slog.Logger) *Manager {
 }
 
 // Load launches a llama-server subprocess for the model, polls its health endpoint
-// until ready, and returns the loaded model record. Behaviour for concurrent calls:
+// until ready, and returns the loaded model record. perModelArgs are appended after
+// the standard model flags and before the manager's global extraArgs. Pass nil for
+// no per-model args. Behaviour for concurrent calls:
 //   - Already loaded: returns the existing record immediately (no new subprocess).
 //   - Load in progress: blocks until complete and returns the same outcome.
 //   - Load failed previously: starts a fresh load attempt.
-func (m *Manager) Load(ctx context.Context, modelID uint64, modelPath, mmprojPath string, contextSize, gpuLayers int) (*LoadedModel, error) {
+func (m *Manager) Load(ctx context.Context, modelID uint64, modelPath, mmprojPath string, contextSize, gpuLayers int, perModelArgs []string) (*LoadedModel, error) {
 	m.mu.Lock()
 
 	if m.closing {
@@ -153,7 +155,7 @@ func (m *Manager) Load(ctx context.Context, modelID uint64, modelPath, mmprojPat
 				return nil, ctx.Err()
 			}
 			// Re-enter after the in-progress operation completes.
-			return m.Load(ctx, modelID, modelPath, mmprojPath, contextSize, gpuLayers)
+			return m.Load(ctx, modelID, modelPath, mmprojPath, contextSize, gpuLayers, perModelArgs)
 
 		case kindFailed:
 			// Previous attempt failed; allow retry by falling through.
@@ -165,7 +167,7 @@ func (m *Manager) Load(ctx context.Context, modelID uint64, modelPath, mmprojPat
 	m.models[modelID] = e
 	m.mu.Unlock()
 
-	record, cmd, ph, loadErr := m.doLoad(ctx, modelID, modelPath, mmprojPath, contextSize, gpuLayers)
+	record, cmd, ph, loadErr := m.doLoad(ctx, modelID, modelPath, mmprojPath, contextSize, gpuLayers, perModelArgs)
 
 	m.mu.Lock()
 	if loadErr != nil {
@@ -189,7 +191,7 @@ func (m *Manager) Load(ctx context.Context, modelID uint64, modelPath, mmprojPat
 }
 
 // doLoad performs the actual subprocess launch, I/O wiring, and health polling.
-func (m *Manager) doLoad(ctx context.Context, modelID uint64, modelPath, mmprojPath string, contextSize, gpuLayers int) (*LoadedModel, *exec.Cmd, *procHandle, error) {
+func (m *Manager) doLoad(ctx context.Context, modelID uint64, modelPath, mmprojPath string, contextSize, gpuLayers int, perModelArgs []string) (*LoadedModel, *exec.Cmd, *procHandle, error) {
 	port, err := freePort()
 	if err != nil {
 		return nil, nil, nil, fmt.Errorf("model %d: no free port: %w", modelID, err)
@@ -205,6 +207,7 @@ func (m *Manager) doLoad(ctx context.Context, modelID uint64, modelPath, mmprojP
 	if mmprojPath != "" {
 		args = append(args, "--mmproj", mmprojPath)
 	}
+	args = append(args, perModelArgs...)
 	args = append(args, m.extraArgs...)
 	cmd := m.newCmd(m.binary, args...)
 

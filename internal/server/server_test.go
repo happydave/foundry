@@ -45,13 +45,16 @@ func (f *fakeRegistry) GetByName(name string) (registry.Model, bool) {
 type fakeProcMgr struct {
 	loaded map[uint64]*processmanager.LoadedModel
 	loadFn func(ctx context.Context, id uint64, path string, ctxSize, gpu int) (*processmanager.LoadedModel, error)
+	// lastPerModelArgs records the perModelArgs passed to the most recent Load call.
+	lastPerModelArgs []string
 }
 
 func newFakeProcMgr() *fakeProcMgr {
 	return &fakeProcMgr{loaded: make(map[uint64]*processmanager.LoadedModel)}
 }
 
-func (f *fakeProcMgr) Load(ctx context.Context, modelID uint64, modelPath, mmprojPath string, contextSize, gpuLayers int) (*processmanager.LoadedModel, error) {
+func (f *fakeProcMgr) Load(ctx context.Context, modelID uint64, modelPath, mmprojPath string, contextSize, gpuLayers int, perModelArgs []string) (*processmanager.LoadedModel, error) {
+	f.lastPerModelArgs = perModelArgs
 	if f.loadFn != nil {
 		return f.loadFn(ctx, modelID, modelPath, contextSize, gpuLayers)
 	}
@@ -123,7 +126,7 @@ func newFixture(t *testing.T) *serverFixture {
 	pm := newFakeProcMgr()
 	est := &fakeEstimator{}
 
-	s := newServer("127.0.0.1:0", reg, pm, est, 35, nil)
+	s := newServer("127.0.0.1:0", reg, pm, est, 35, nil, nil)
 	s.queryResources = func() (uint64, uint64, error) { return 8 << 30, 8 << 30, nil }
 	s.queryVRAMTotal = func() (uint64, error) { return 16 << 30, nil }
 
@@ -429,6 +432,44 @@ func TestLoadModel_UsesConfigGPULayers(t *testing.T) {
 	_ = resp.Body.Close()
 	if gotGPU != 99 {
 		t.Errorf("expected gpu layers 99, got %d", gotGPU)
+	}
+}
+
+func TestLoadModel_PerModelArgs_Threaded(t *testing.T) {
+	f := newFixture(t)
+	m := testModel(1)
+	f.reg.models = []registry.Model{m}
+	f.srv.perModelArgs = map[string][]string{
+		"test-model": {"--chat-template-file", "/path/to/template.jinja"},
+	}
+
+	resp := f.do(t, http.MethodPost, "/api/v1/models/1/load", nil)
+	assertStatus(t, resp, http.StatusOK)
+	_ = resp.Body.Close()
+
+	want := []string{"--chat-template-file", "/path/to/template.jinja"}
+	if len(f.pm.lastPerModelArgs) != len(want) {
+		t.Fatalf("perModelArgs = %v, want %v", f.pm.lastPerModelArgs, want)
+	}
+	for i, v := range want {
+		if f.pm.lastPerModelArgs[i] != v {
+			t.Errorf("perModelArgs[%d] = %q, want %q", i, f.pm.lastPerModelArgs[i], v)
+		}
+	}
+}
+
+func TestLoadModel_NoPerModelArgs_NilPassed(t *testing.T) {
+	f := newFixture(t)
+	m := testModel(1)
+	f.reg.models = []registry.Model{m}
+	// perModelArgs map is nil — no config for any model
+
+	resp := f.do(t, http.MethodPost, "/api/v1/models/1/load", nil)
+	assertStatus(t, resp, http.StatusOK)
+	_ = resp.Body.Close()
+
+	if f.pm.lastPerModelArgs != nil {
+		t.Errorf("expected nil perModelArgs for model with no config, got %v", f.pm.lastPerModelArgs)
 	}
 }
 

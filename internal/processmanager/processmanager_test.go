@@ -102,7 +102,7 @@ func TestLoad_Success(t *testing.T) {
 	m := newTestManager(t, "healthy")
 	ctx := context.Background()
 
-	rec, err := m.Load(ctx, 1, "/fake/model.gguf", "", 4096, 32)
+	rec, err := m.Load(ctx, 1, "/fake/model.gguf", "", 4096, 32, nil)
 	if err != nil {
 		t.Fatalf("Load: unexpected error: %v", err)
 	}
@@ -143,11 +143,11 @@ func TestLoad_AlreadyLoaded_ReturnsSameRecord(t *testing.T) {
 	m := newTestManager(t, "healthy")
 	ctx := context.Background()
 
-	rec1, err := m.Load(ctx, 1, "/fake/model.gguf", "", 4096, 32)
+	rec1, err := m.Load(ctx, 1, "/fake/model.gguf", "", 4096, 32, nil)
 	if err != nil {
 		t.Fatalf("first Load: %v", err)
 	}
-	rec2, err := m.Load(ctx, 1, "/fake/model.gguf", "", 4096, 32)
+	rec2, err := m.Load(ctx, 1, "/fake/model.gguf", "", 4096, 32, nil)
 	if err != nil {
 		t.Fatalf("second Load: %v", err)
 	}
@@ -162,7 +162,7 @@ func TestLoad_Failure_SubprocessCrash(t *testing.T) {
 	m := newTestManager(t, "crash")
 	ctx := context.Background()
 
-	_, err := m.Load(ctx, 1, "/fake/model.gguf", "", 4096, 32)
+	_, err := m.Load(ctx, 1, "/fake/model.gguf", "", 4096, 32, nil)
 	if err == nil {
 		t.Fatal("Load: expected error for crashing subprocess, got nil")
 	}
@@ -192,7 +192,7 @@ func TestLoad_ConcurrentSameModel_OneSubprocess(t *testing.T) {
 			defer done.Done()
 			ready.Done()
 			<-start
-			results[i], errs[i] = m.Load(ctx, 42, "/fake/model.gguf", "", 2048, 16)
+			results[i], errs[i] = m.Load(ctx, 42, "/fake/model.gguf", "", 2048, 16, nil)
 		}()
 	}
 
@@ -222,7 +222,7 @@ func TestUnload_Clean(t *testing.T) {
 	m := newTestManager(t, "healthy")
 	ctx := context.Background()
 
-	rec, err := m.Load(ctx, 1, "/fake/model.gguf", "", 4096, 32)
+	rec, err := m.Load(ctx, 1, "/fake/model.gguf", "", 4096, 32, nil)
 	if err != nil {
 		t.Fatalf("Load: %v", err)
 	}
@@ -258,7 +258,7 @@ func TestUnload_SIGKILLEscalation(t *testing.T) {
 	m := newTestManager(t, "hang")
 	ctx := context.Background()
 
-	if _, err := m.Load(ctx, 1, "/fake/model.gguf", "", 4096, 32); err != nil {
+	if _, err := m.Load(ctx, 1, "/fake/model.gguf", "", 4096, 32, nil); err != nil {
 		t.Fatalf("Load: %v", err)
 	}
 
@@ -282,7 +282,7 @@ func TestCrash_MarksModelUnavailable(t *testing.T) {
 	m := newTestManager(t, "healthy")
 	ctx := context.Background()
 
-	rec, err := m.Load(ctx, 1, "/fake/model.gguf", "", 4096, 32)
+	rec, err := m.Load(ctx, 1, "/fake/model.gguf", "", 4096, 32, nil)
 	if err != nil {
 		t.Fatalf("Load: %v", err)
 	}
@@ -324,7 +324,7 @@ func TestShutdown_RejectsNewLoad(t *testing.T) {
 
 	_ = m.UnloadAll(ctx)
 
-	if _, err := m.Load(ctx, 1, "/fake/model.gguf", "", 4096, 32); err == nil {
+	if _, err := m.Load(ctx, 1, "/fake/model.gguf", "", 4096, 32, nil); err == nil {
 		t.Fatal("Load after UnloadAll: expected error, got nil")
 	}
 }
@@ -347,7 +347,7 @@ func TestLogCapture_SubprocessOutputForwarded(t *testing.T) {
 	}
 	ctx := context.Background()
 
-	if _, err := m.Load(ctx, 1, "/fake/model.gguf", "", 4096, 32); err != nil {
+	if _, err := m.Load(ctx, 1, "/fake/model.gguf", "", 4096, 32, nil); err != nil {
 		t.Fatalf("Load: %v", err)
 	}
 	time.Sleep(100 * time.Millisecond)
@@ -374,7 +374,7 @@ func TestLoad_ExtraArgsAppended(t *testing.T) {
 	}
 
 	ctx := context.Background()
-	rec, err := m.Load(ctx, 1, "/fake/model.gguf", "", 4096, 32)
+	rec, err := m.Load(ctx, 1, "/fake/model.gguf", "", 4096, 32, nil)
 	if err != nil {
 		t.Fatalf("Load: unexpected error: %v", err)
 	}
@@ -389,6 +389,48 @@ func TestLoad_ExtraArgsAppended(t *testing.T) {
 	}
 	if !found {
 		t.Errorf("extra args not found in subprocess args: %v", capturedArgs)
+	}
+}
+
+func TestLoad_PerModelArgsOrdering(t *testing.T) {
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	m := New(os.Args[0], []string{"--global-flag"}, logger)
+
+	var capturedArgs []string
+	m.newCmd = func(_ string, args ...string) *exec.Cmd {
+		capturedArgs = append(capturedArgs[:0], args...)
+		cmd := exec.Command(os.Args[0], args...)
+		cmd.Env = append(os.Environ(), helperEnvKey+"=healthy")
+		return cmd
+	}
+
+	ctx := context.Background()
+	perModel := []string{"--chat-template-file", "/tmpl.jinja"}
+	rec, err := m.Load(ctx, 1, "/fake/model.gguf", "", 4096, 32, perModel)
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	_ = m.Unload(ctx, rec.ModelID)
+
+	// Find positions of the per-model flag and the global flag.
+	perModelIdx := -1
+	globalIdx := -1
+	for i, arg := range capturedArgs {
+		if arg == "--chat-template-file" {
+			perModelIdx = i
+		}
+		if arg == "--global-flag" {
+			globalIdx = i
+		}
+	}
+	if perModelIdx == -1 {
+		t.Fatal("--chat-template-file not found in subprocess args")
+	}
+	if globalIdx == -1 {
+		t.Fatal("--global-flag not found in subprocess args")
+	}
+	if perModelIdx > globalIdx {
+		t.Errorf("per-model arg (idx %d) must appear before global extra arg (idx %d)", perModelIdx, globalIdx)
 	}
 }
 

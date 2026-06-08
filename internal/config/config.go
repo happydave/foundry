@@ -4,19 +4,28 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"strings"
 
 	"gopkg.in/yaml.v3"
 )
 
+// ModelConfig holds per-model overrides. Keys in the top-level Models map are
+// model DisplayNames (GGUF filename without the .gguf extension).
+type ModelConfig struct {
+	ChatTemplate     string `yaml:"chat_template"`
+	ChatTemplateFile string `yaml:"chat_template_file"`
+}
+
 type Config struct {
-	ModelScanPaths       []string `yaml:"model_scan_paths"`
-	LlamaServerBinary    string   `yaml:"llama_server_binary"`
-	LlamaServerExtraArgs []string `yaml:"llama_server_extra_args"`
-	DefaultGPULayers     int      `yaml:"default_gpu_layers"`
-	KVCacheType          string   `yaml:"kv_cache_type"`
-	HistorySessionsDir   string   `yaml:"history_sessions_dir"`
-	ListenAddress        string   `yaml:"listen_address"`
-	LogLevel             string   `yaml:"log_level"`
+	ModelScanPaths       []string               `yaml:"model_scan_paths"`
+	LlamaServerBinary    string                 `yaml:"llama_server_binary"`
+	LlamaServerExtraArgs []string               `yaml:"llama_server_extra_args"`
+	DefaultGPULayers     int                    `yaml:"default_gpu_layers"`
+	KVCacheType          string                 `yaml:"kv_cache_type"`
+	HistorySessionsDir   string                 `yaml:"history_sessions_dir"`
+	ListenAddress        string                 `yaml:"listen_address"`
+	LogLevel             string                 `yaml:"log_level"`
+	Models               map[string]ModelConfig `yaml:"models"`
 }
 
 func Load(path string) (*Config, error) {
@@ -60,6 +69,11 @@ func (c *Config) validate() error {
 	}
 	if c.HistorySessionsDir == "" {
 		errs = append(errs, errors.New("history_sessions_dir is required"))
+	}
+	for name, mc := range c.Models {
+		if strings.TrimSpace(mc.ChatTemplate) != "" && strings.TrimSpace(mc.ChatTemplateFile) != "" {
+			errs = append(errs, fmt.Errorf("model %q: chat_template and chat_template_file are mutually exclusive", name))
+		}
 	}
 	return errors.Join(errs...)
 }

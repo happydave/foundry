@@ -27,7 +27,7 @@ type modelRegistry interface {
 
 // processManager is the subset of processmanager.Manager used by the server.
 type processManager interface {
-	Load(ctx context.Context, modelID uint64, modelPath, mmprojPath string, contextSize, gpuLayers int) (*processmanager.LoadedModel, error)
+	Load(ctx context.Context, modelID uint64, modelPath, mmprojPath string, contextSize, gpuLayers int, perModelArgs []string) (*processmanager.LoadedModel, error)
 	Unload(ctx context.Context, modelID uint64) error
 	List() []*processmanager.LoadedModel
 	Get(modelID uint64) (*processmanager.LoadedModel, bool)
@@ -45,6 +45,7 @@ type Server struct {
 	procMgr          processManager
 	estimator        resourceEstimator
 	defaultGPULayers int
+	perModelArgs     map[string][]string // keyed by DisplayName; absent entry means no per-model args
 	logger           *slog.Logger
 
 	// inferenceHook, if set, is called before each inference request is proxied.
@@ -58,8 +59,8 @@ type Server struct {
 	queryVRAMTotal func() (uint64, error)
 }
 
-func New(addr string, reg *registry.Registry, pm *processmanager.Manager, est *estimator.Estimator, defaultGPULayers int, logger *slog.Logger) *Server {
-	return newServer(addr, reg, pm, est, defaultGPULayers, logger)
+func New(addr string, reg *registry.Registry, pm *processmanager.Manager, est *estimator.Estimator, defaultGPULayers int, perModelArgs map[string][]string, logger *slog.Logger) *Server {
+	return newServer(addr, reg, pm, est, defaultGPULayers, perModelArgs, logger)
 }
 
 // SetHistoryStore attaches a history store to the server, enabling persistent
@@ -68,12 +69,13 @@ func (s *Server) SetHistoryStore(store history.Store) {
 	s.historyStore = store
 }
 
-func newServer(addr string, reg modelRegistry, pm processManager, est resourceEstimator, defaultGPULayers int, logger *slog.Logger) *Server {
+func newServer(addr string, reg modelRegistry, pm processManager, est resourceEstimator, defaultGPULayers int, perModelArgs map[string][]string, logger *slog.Logger) *Server {
 	s := &Server{
 		registry:         reg,
 		procMgr:          pm,
 		estimator:        est,
 		defaultGPULayers: defaultGPULayers,
+		perModelArgs:     perModelArgs,
 		logger:           logger,
 		queryResources:   estimator.QueryResources,
 		queryVRAMTotal:   estimator.QueryVRAMTotal,
@@ -382,7 +384,7 @@ func (s *Server) handleLoadModel(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	lm, err := s.procMgr.Load(r.Context(), id, m.Path, m.MmprojPath, ctxSize, s.defaultGPULayers)
+	lm, err := s.procMgr.Load(r.Context(), id, m.Path, m.MmprojPath, ctxSize, s.defaultGPULayers, s.perModelArgs[m.DisplayName])
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, fmt.Sprintf("failed to load model: %v", err))
 		return

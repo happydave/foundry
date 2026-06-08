@@ -6,6 +6,7 @@ import (
 	"log/slog"
 	"os"
 	"os/signal"
+	"strings"
 	"syscall"
 
 	"github.com/happydave/foundry/internal/config"
@@ -42,7 +43,16 @@ func main() {
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGTERM, os.Interrupt)
 	defer stop()
 
-	srv := server.New(cfg.ListenAddress, reg, pm, est, cfg.DefaultGPULayers, logger)
+	perModelArgs := make(map[string][]string, len(cfg.Models))
+	for name, mc := range cfg.Models {
+		if f := strings.TrimSpace(mc.ChatTemplateFile); f != "" {
+			perModelArgs[name] = []string{"--chat-template-file", f}
+		} else if t := strings.TrimSpace(mc.ChatTemplate); t != "" {
+			perModelArgs[name] = []string{"--chat-template", t}
+		}
+	}
+
+	srv := server.New(cfg.ListenAddress, reg, pm, est, cfg.DefaultGPULayers, perModelArgs, logger)
 
 	if fi, err := os.Stat(cfg.HistorySessionsDir); err != nil || !fi.IsDir() {
 		logger.Warn("history_sessions_dir does not exist or is not a directory; persistent session history is disabled",

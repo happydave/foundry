@@ -57,7 +57,33 @@ log_level: info
 # Useful for backend selectors and site-specific flags not otherwise exposed by Foundry.
 # llama_server_extra_args:
 #   - --vulkan
+
+# Per-model overrides, keyed by model DisplayName (GGUF filename without .gguf extension).
+# Each entry is optional. Unknown fields are rejected at startup.
+# models:
+#   my-model-name:
+#     # Override the Jinja2 chat template embedded in the model's GGUF.
+#     # Use chat_template_file to supply the template from a file (recommended for
+#     # multi-line templates), or chat_template for a short inline string.
+#     # These fields are mutually exclusive; specifying both is a startup error.
+#     chat_template_file: /path/to/template.jinja
+#     # chat_template: "{{ bos_token }}{% for message in messages %}..."
 ```
+
+**Gemma-4 chat template:** Gemma-4 models bundled with an outdated template produce a
+`common_chat_try_specialized_template` warning at startup. Suppress it by pointing to the
+official template file:
+
+```yaml
+models:
+  gemma-4-31B-it:
+    chat_template_file: /home/dave/Documents/jinja/gemma-4-31B-it/chat_template.jinja
+  gemma-4-26B-A4B-it:
+    chat_template_file: /home/dave/Documents/jinja/gemma-4-26B-A4B-it/chat_template.jinja
+```
+
+Template args are passed to llama-server after the standard model flags
+(`--model`, `--ctx-size`, etc.) and before `llama_server_extra_args`.
 
 Run:
 

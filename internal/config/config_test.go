@@ -118,3 +118,101 @@ func TestLoad_UnparsableYAML(t *testing.T) {
 		t.Fatal("expected parse error, got nil")
 	}
 }
+
+func TestLoad_ModelConfig_MutualExclusion(t *testing.T) {
+	path := writeTemp(t, `
+model_scan_paths: [/m]
+llama_server_binary: /bin/llama
+kv_cache_type: f16
+history_sessions_dir: /s
+models:
+  my-model:
+    chat_template: "hello"
+    chat_template_file: /some/path.jinja
+`)
+	_, err := Load(path)
+	if err == nil {
+		t.Fatal("expected error for mutually exclusive fields, got nil")
+	}
+	if got := err.Error(); !strings.Contains(got, "mutually exclusive") {
+		t.Errorf("error %q does not mention mutually exclusive", got)
+	}
+	if got := err.Error(); !strings.Contains(got, "my-model") {
+		t.Errorf("error %q does not identify the model name", got)
+	}
+}
+
+func TestLoad_ModelConfig_OnlyChatTemplate_Valid(t *testing.T) {
+	path := writeTemp(t, `
+model_scan_paths: [/m]
+llama_server_binary: /bin/llama
+kv_cache_type: f16
+history_sessions_dir: /s
+models:
+  my-model:
+    chat_template: "some template"
+`)
+	cfg, err := Load(path)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	mc, ok := cfg.Models["my-model"]
+	if !ok {
+		t.Fatal("model config not found")
+	}
+	if mc.ChatTemplate != "some template" {
+		t.Errorf("ChatTemplate = %q, want %q", mc.ChatTemplate, "some template")
+	}
+}
+
+func TestLoad_ModelConfig_OnlyChatTemplateFile_Valid(t *testing.T) {
+	path := writeTemp(t, `
+model_scan_paths: [/m]
+llama_server_binary: /bin/llama
+kv_cache_type: f16
+history_sessions_dir: /s
+models:
+  my-model:
+    chat_template_file: /path/to/template.jinja
+`)
+	cfg, err := Load(path)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if cfg.Models["my-model"].ChatTemplateFile != "/path/to/template.jinja" {
+		t.Errorf("ChatTemplateFile = %q", cfg.Models["my-model"].ChatTemplateFile)
+	}
+}
+
+func TestLoad_ModelConfig_BothEmpty_Valid(t *testing.T) {
+	path := writeTemp(t, `
+model_scan_paths: [/m]
+llama_server_binary: /bin/llama
+kv_cache_type: f16
+history_sessions_dir: /s
+models:
+  my-model:
+    chat_template: "   "
+    chat_template_file: "   "
+`)
+	_, err := Load(path)
+	if err != nil {
+		t.Fatalf("whitespace-only fields should not trigger mutual exclusion error: %v", err)
+	}
+}
+
+func TestLoad_ModelConfig_UnknownField_Rejected(t *testing.T) {
+	path := writeTemp(t, `
+model_scan_paths: [/m]
+llama_server_binary: /bin/llama
+kv_cache_type: f16
+history_sessions_dir: /s
+models:
+  my-model:
+    unknown_field: value
+`)
+	_, err := Load(path)
+	if err == nil {
+		t.Fatal("expected error for unknown field in model config, got nil")
+	}
+}
