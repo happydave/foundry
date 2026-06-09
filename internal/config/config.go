@@ -11,10 +11,15 @@ import (
 
 // validKVCacheTypes lists the supported KV cache element types.
 var validKVCacheTypes = map[string]bool{
-	"f16":  true,
-	"bf16": true,
-	"f32":  true,
-	"q8_0": true,
+	"f32":    true,
+	"f16":    true,
+	"bf16":   true,
+	"q8_0":   true,
+	"q4_0":   true,
+	"q4_1":   true,
+	"iq4_nl": true,
+	"q5_0":   true,
+	"q5_1":   true,
 }
 
 // ModelConfig holds per-model overrides. Keys in the top-level Models map are
@@ -80,14 +85,14 @@ func (c *Config) validate() error {
 		errs = append(errs, errors.New("history_sessions_dir is required"))
 	}
 	if c.KVCacheType != "" && !validKVCacheTypes[c.KVCacheType] {
-		errs = append(errs, fmt.Errorf("kv_cache_type %q is not supported; must be one of: f16, bf16, f32, q8_0", c.KVCacheType))
+		errs = append(errs, fmt.Errorf("kv_cache_type %q is not supported; must be one of: f32, f16, bf16, q8_0, q4_0, q4_1, iq4_nl, q5_0, q5_1", c.KVCacheType))
 	}
 	for name, mc := range c.Models {
 		if strings.TrimSpace(mc.ChatTemplate) != "" && strings.TrimSpace(mc.ChatTemplateFile) != "" {
 			errs = append(errs, fmt.Errorf("model %q: chat_template and chat_template_file are mutually exclusive", name))
 		}
 		if mc.KVCacheType != "" && !validKVCacheTypes[mc.KVCacheType] {
-			errs = append(errs, fmt.Errorf("model %q: kv_cache_type %q is not supported; must be one of: f16, bf16, f32, q8_0", name, mc.KVCacheType))
+			errs = append(errs, fmt.Errorf("model %q: kv_cache_type %q is not supported; must be one of: f32, f16, bf16, q8_0, q4_0, q4_1, iq4_nl, q5_0, q5_1", name, mc.KVCacheType))
 		}
 	}
 	return errors.Join(errs...)

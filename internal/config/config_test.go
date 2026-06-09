@@ -1,6 +1,7 @@
 package config
 
 import (
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
@@ -128,17 +129,37 @@ func TestLoad_KVCacheType_Invalid(t *testing.T) {
 model_scan_paths: [/m]
 llama_server_binary: /bin/llama
 history_sessions_dir: /s
-kv_cache_type: q4_0
+kv_cache_type: garbage
 `)
 	_, err := Load(path)
 	if err == nil {
 		t.Fatal("expected error for unsupported kv_cache_type, got nil")
 	}
-	if got := err.Error(); !strings.Contains(got, "q4_0") {
-		t.Errorf("error %q does not mention the invalid value %q", got, "q4_0")
+	if got := err.Error(); !strings.Contains(got, "garbage") {
+		t.Errorf("error %q does not mention the invalid value %q", got, "garbage")
 	}
 	if got := err.Error(); !strings.Contains(got, "kv_cache_type") {
 		t.Errorf("error %q does not mention kv_cache_type", got)
+	}
+}
+
+func TestLoad_KVCacheType_NewTypesValid(t *testing.T) {
+	for _, kvType := range []string{"q4_0", "q4_1", "iq4_nl", "q5_0", "q5_1"} {
+		t.Run(kvType, func(t *testing.T) {
+			path := writeTemp(t, fmt.Sprintf(`
+model_scan_paths: [/m]
+llama_server_binary: /bin/llama
+history_sessions_dir: /s
+kv_cache_type: %s
+`, kvType))
+			cfg, err := Load(path)
+			if err != nil {
+				t.Fatalf("unexpected error for kv_cache_type %q: %v", kvType, err)
+			}
+			if cfg.KVCacheType != kvType {
+				t.Errorf("KVCacheType = %q, want %q", cfg.KVCacheType, kvType)
+			}
+		})
 	}
 }
 
@@ -272,7 +293,7 @@ llama_server_binary: /bin/llama
 history_sessions_dir: /s
 models:
   my-model:
-    kv_cache_type: q4_0
+    kv_cache_type: garbage
 `)
 	_, err := Load(path)
 	if err == nil {
@@ -281,7 +302,29 @@ models:
 	if got := err.Error(); !strings.Contains(got, "my-model") {
 		t.Errorf("error %q does not identify the model name", got)
 	}
-	if got := err.Error(); !strings.Contains(got, "q4_0") {
+	if got := err.Error(); !strings.Contains(got, "garbage") {
 		t.Errorf("error %q does not mention the invalid value", got)
+	}
+}
+
+func TestLoad_ModelConfig_KVCacheType_NewTypesValid(t *testing.T) {
+	for _, kvType := range []string{"q4_0", "q4_1", "iq4_nl", "q5_0", "q5_1"} {
+		t.Run(kvType, func(t *testing.T) {
+			path := writeTemp(t, fmt.Sprintf(`
+model_scan_paths: [/m]
+llama_server_binary: /bin/llama
+history_sessions_dir: /s
+models:
+  my-model:
+    kv_cache_type: %s
+`, kvType))
+			cfg, err := Load(path)
+			if err != nil {
+				t.Fatalf("unexpected error for per-model kv_cache_type %q: %v", kvType, err)
+			}
+			if cfg.Models["my-model"].KVCacheType != kvType {
+				t.Errorf("per-model KVCacheType = %q, want %q", cfg.Models["my-model"].KVCacheType, kvType)
+			}
+		})
 	}
 }
