@@ -39,14 +39,14 @@ func llamaModel() ModelSpec {
 
 func TestForward_Formula(t *testing.T) {
 	model := llamaModel()
-	// KV cost = 32 * 8 * 128 * 4096 * 2 * 2 = 536870912 bytes (512 MiB) for f16
+	// KV cost = 32 * 8 * 128 * 4096 * 2 * 2 = 536870912 bytes (512 MiB) for f16, nParallel=1
 	wantKV := uint64(32) * 8 * 128 * 4096 * 2 * 2
 	wantWeight := uint64(1 << 30)
 	wantTotal := wantWeight + wantKV
 
 	// Give plenty of memory so feasibility is true.
 	e := testEstimator(16<<30, 16<<30)
-	r, err := e.Forward(model, 4096, 0, "f16")
+	r, err := e.Forward(model, 4096, 0, "f16", 1)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -75,7 +75,7 @@ func TestForward_Feasible_BoundaryFalse(t *testing.T) {
 	budget := uint64(float64(totalCost) * 1.14)
 
 	e := testEstimator(budget, 0)
-	r, err := e.Forward(model, 4096, 0, "f16")
+	r, err := e.Forward(model, 4096, 0, "f16", 1)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -95,7 +95,7 @@ func TestForward_Feasible_BoundaryTrue(t *testing.T) {
 	budget := uint64(float64(totalCost) * 1.16)
 
 	e := testEstimator(budget, 0)
-	r, err := e.Forward(model, 4096, 0, "f16")
+	r, err := e.Forward(model, 4096, 0, "f16", 1)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -111,7 +111,7 @@ func TestForward_InUseBytes_ReducesVRAM(t *testing.T) {
 
 	// With 20 GiB VRAM and 5 GiB in use, effective VRAM = 15 GiB — still plenty.
 	e := testEstimator(20<<30, 0)
-	r, err := e.Forward(model, 4096, 5<<30, "f16")
+	r, err := e.Forward(model, 4096, 5<<30, "f16", 1)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -127,7 +127,7 @@ func TestForward_InUseBytes_ExceedsVRAM_NoNegative(t *testing.T) {
 	model := llamaModel()
 	// VRAM available = 1 GiB but 2 GiB in use → adjusted VRAM = 0, budget = RAM only.
 	e := testEstimator(1<<30, 0)
-	r, err := e.Forward(model, 4096, 2<<30, "f16")
+	r, err := e.Forward(model, 4096, 2<<30, "f16", 1)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -143,7 +143,7 @@ func TestForward_CtxClampedToMaxContext(t *testing.T) {
 	kvAt4096 := uint64(32) * 8 * 128 * 4096 * 2 * 2
 
 	e := testEstimator(32<<30, 32<<30)
-	r, err := e.Forward(model, 8192, 0, "f16")
+	r, err := e.Forward(model, 8192, 0, "f16", 1)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -160,7 +160,7 @@ func TestForward_KVType_Q8(t *testing.T) {
 	wantKV := uint64(32) * 8 * 128 * 4096 * 2 * 34 / 32
 
 	e := testEstimator(32<<30, 32<<30)
-	r, err := e.Forward(model, 4096, 0, "q8_0")
+	r, err := e.Forward(model, 4096, 0, "q8_0", 1)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -176,7 +176,7 @@ func TestForward_KVType_F32(t *testing.T) {
 	kvF32 := kvF16 * 2
 
 	e := testEstimator(32<<30, 32<<30)
-	r, err := e.Forward(model, 4096, 0, "f32")
+	r, err := e.Forward(model, 4096, 0, "f32", 1)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -187,7 +187,7 @@ func TestForward_KVType_F32(t *testing.T) {
 
 func TestForward_ZeroCtx_Error(t *testing.T) {
 	e := testEstimator(16<<30, 16<<30)
-	_, err := e.Forward(llamaModel(), 0, 0, "f16")
+	_, err := e.Forward(llamaModel(), 0, 0, "f16", 1)
 	if err == nil {
 		t.Error("expected error for zero context size")
 	}
@@ -197,7 +197,7 @@ func TestForward_ZeroKVHeadCount_Error(t *testing.T) {
 	model := llamaModel()
 	model.KVHeadCount = 0
 	e := testEstimator(16<<30, 16<<30)
-	_, err := e.Forward(model, 4096, 0, "f16")
+	_, err := e.Forward(model, 4096, 0, "f16", 1)
 	if err == nil {
 		t.Error("expected error for zero KV head count")
 	}
@@ -207,7 +207,7 @@ func TestForward_ZeroHeadDim_Error(t *testing.T) {
 	model := llamaModel()
 	model.HeadDim = 0
 	e := testEstimator(16<<30, 16<<30)
-	_, err := e.Forward(model, 4096, 0, "f16")
+	_, err := e.Forward(model, 4096, 0, "f16", 1)
 	if err == nil {
 		t.Error("expected error for zero head dimension")
 	}
@@ -215,7 +215,7 @@ func TestForward_ZeroHeadDim_Error(t *testing.T) {
 
 func TestForward_ResourceQueryError(t *testing.T) {
 	e := errEstimator(errors.New("vulkan unavailable"))
-	_, err := e.Forward(llamaModel(), 4096, 0, "f16")
+	_, err := e.Forward(llamaModel(), 4096, 0, "f16", 1)
 	if err == nil {
 		t.Error("expected error when resource query fails")
 	}
@@ -228,7 +228,7 @@ func TestInverse_BasicResult(t *testing.T) {
 
 	// Give enough memory to load at a non-trivial context.
 	e := testEstimator(16<<30, 16<<30)
-	r, err := e.Inverse(model, 0, "f16")
+	r, err := e.Inverse(model, 0, "f16", 1)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -245,7 +245,7 @@ func TestInverse_ClampedToNativeMax(t *testing.T) {
 
 	// Enormous memory — inverse should be clamped to 4096, not higher.
 	e := testEstimator(512<<30, 512<<30)
-	r, err := e.Inverse(model, 0, "f16")
+	r, err := e.Inverse(model, 0, "f16", 1)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -260,7 +260,7 @@ func TestInverse_ModelDoesNotFit(t *testing.T) {
 
 	// Only 4 GiB available — model does not fit.
 	e := testEstimator(4<<30, 0)
-	r, err := e.Inverse(model, 0, "f16")
+	r, err := e.Inverse(model, 0, "f16", 1)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -273,7 +273,7 @@ func TestInverse_ZeroMemoryAfterInUse(t *testing.T) {
 	model := llamaModel()
 	// All VRAM consumed, no RAM.
 	e := testEstimator(4<<30, 0)
-	r, err := e.Inverse(model, 4<<30, "f16")
+	r, err := e.Inverse(model, 4<<30, "f16", 1)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -288,7 +288,7 @@ func TestInverse_InverseIsConsistentWithForward(t *testing.T) {
 	ram := uint64(4 << 30)
 
 	e := testEstimator(vram, ram)
-	inv, err := e.Inverse(model, 0, "f16")
+	inv, err := e.Inverse(model, 0, "f16", 1)
 	if err != nil {
 		t.Fatalf("Inverse error: %v", err)
 	}
@@ -297,7 +297,7 @@ func TestInverse_InverseIsConsistentWithForward(t *testing.T) {
 	}
 
 	// Forward at the reported max context must be feasible.
-	fwd, err := e.Forward(model, inv.MaxContext, 0, "f16")
+	fwd, err := e.Forward(model, inv.MaxContext, 0, "f16", 1)
 	if err != nil {
 		t.Fatalf("Forward error: %v", err)
 	}
@@ -310,7 +310,7 @@ func TestInverse_ZeroLayerCount_Error(t *testing.T) {
 	model := llamaModel()
 	model.LayerCount = 0
 	e := testEstimator(16<<30, 16<<30)
-	_, err := e.Inverse(model, 0, "f16")
+	_, err := e.Inverse(model, 0, "f16", 1)
 	if err == nil {
 		t.Error("expected error when LayerCount=0 produces zero bytes-per-token")
 	}
@@ -320,7 +320,7 @@ func TestInverse_ZeroKVHeadCount_Error(t *testing.T) {
 	model := llamaModel()
 	model.KVHeadCount = 0
 	e := testEstimator(16<<30, 16<<30)
-	_, err := e.Inverse(model, 0, "f16")
+	_, err := e.Inverse(model, 0, "f16", 1)
 	if err == nil {
 		t.Error("expected error for zero KV head count")
 	}
@@ -330,7 +330,7 @@ func TestInverse_ZeroHeadDim_Error(t *testing.T) {
 	model := llamaModel()
 	model.HeadDim = 0
 	e := testEstimator(16<<30, 16<<30)
-	_, err := e.Inverse(model, 0, "f16")
+	_, err := e.Inverse(model, 0, "f16", 1)
 	if err == nil {
 		t.Error("expected error for zero head dimension")
 	}
@@ -338,9 +338,123 @@ func TestInverse_ZeroHeadDim_Error(t *testing.T) {
 
 func TestInverse_ResourceQueryError(t *testing.T) {
 	e := errEstimator(errors.New("vulkan unavailable"))
-	_, err := e.Inverse(llamaModel(), 0, "f16")
+	_, err := e.Inverse(llamaModel(), 0, "f16", 1)
 	if err == nil {
 		t.Error("expected error when resource query fails")
+	}
+}
+
+// --- nParallel tests ---
+
+func TestForward_NParallel_ScalesKVCost(t *testing.T) {
+	model := llamaModel()
+	e := testEstimator(256<<30, 256<<30)
+
+	r1, err := e.Forward(model, 4096, 0, "f16", 1)
+	if err != nil {
+		t.Fatalf("Forward(nParallel=1): %v", err)
+	}
+	r4, err := e.Forward(model, 4096, 0, "f16", 4)
+	if err != nil {
+		t.Fatalf("Forward(nParallel=4): %v", err)
+	}
+
+	if r4.KVCost != r1.KVCost*4 {
+		t.Errorf("KVCost(nParallel=4) = %d, want %d (4× nParallel=1)", r4.KVCost, r1.KVCost*4)
+	}
+	if r4.WeightCost != r1.WeightCost {
+		t.Errorf("WeightCost should be unaffected by nParallel: got %d, want %d", r4.WeightCost, r1.WeightCost)
+	}
+}
+
+func TestForward_NParallelZero_Error(t *testing.T) {
+	e := testEstimator(16<<30, 16<<30)
+	_, err := e.Forward(llamaModel(), 4096, 0, "f16", 0)
+	if err == nil {
+		t.Error("expected error for nParallel=0")
+	}
+}
+
+func TestForward_NParallelNegative_Error(t *testing.T) {
+	e := testEstimator(16<<30, 16<<30)
+	_, err := e.Forward(llamaModel(), 4096, 0, "f16", -1)
+	if err == nil {
+		t.Error("expected error for nParallel=-1")
+	}
+}
+
+func TestInverse_NParallel_ReducesMaxContext(t *testing.T) {
+	// Use a model with large MaxContext and limited memory so the memory budget —
+	// not the native cap — is the binding constraint for both nParallel values.
+	// 3 GiB total with 1 GiB weights leaves ~1.6 GiB for KV after headroom:
+	//   bytesPerToken (f16, nParallel=1) = 32*8*128*2*2 = 131072
+	//   maxCtx(nParallel=1) ≈ 13170   (well below MaxContext=100000)
+	//   maxCtx(nParallel=4) ≈  3292   (ratio ≈ 4.0)
+	model := llamaModel()
+	model.MaxContext = 100000 // large native cap — won't be the binding constraint
+
+	e := testEstimator(3<<30, 0)
+
+	r1, err := e.Inverse(model, 0, "f16", 1)
+	if err != nil {
+		t.Fatalf("Inverse(nParallel=1): %v", err)
+	}
+	r4, err := e.Inverse(model, 0, "f16", 4)
+	if err != nil {
+		t.Fatalf("Inverse(nParallel=4): %v", err)
+	}
+
+	if r4.MaxContext == 0 {
+		t.Fatal("MaxContext(nParallel=4) is 0 with 3 GiB memory")
+	}
+	ratio := float64(r1.MaxContext) / float64(r4.MaxContext)
+	if ratio < 3.5 || ratio > 4.5 {
+		t.Errorf("MaxContext ratio (nParallel=1 / nParallel=4) = %.2f, want ~4.0", ratio)
+	}
+	// nParallel=4 must be ≤ MaxContext.
+	if r4.MaxContext > model.MaxContext {
+		t.Errorf("MaxContext(nParallel=4) = %d exceeds native max %d", r4.MaxContext, model.MaxContext)
+	}
+}
+
+func TestInverse_NParallel_ConsistentWithForward(t *testing.T) {
+	model := llamaModel()
+	model.MaxContext = 1 << 20 // avoid native-max clamp masking the test
+	vram := uint64(12 << 30)
+	ram := uint64(4 << 30)
+
+	for _, nParallel := range []int{1, 2, 4} {
+		e := testEstimator(vram, ram)
+		inv, err := e.Inverse(model, 0, "f16", nParallel)
+		if err != nil {
+			t.Fatalf("Inverse(nParallel=%d): %v", nParallel, err)
+		}
+		if inv.MaxContext == 0 {
+			t.Skipf("no context fits at nParallel=%d; skipping consistency check", nParallel)
+		}
+		fwd, err := e.Forward(model, inv.MaxContext, 0, "f16", nParallel)
+		if err != nil {
+			t.Fatalf("Forward(nParallel=%d): %v", nParallel, err)
+		}
+		if !fwd.Feasible {
+			t.Errorf("Forward at Inverse.MaxContext=%d (nParallel=%d) is not feasible", inv.MaxContext, nParallel)
+		}
+	}
+}
+
+func TestInverse_NParallelZero_Error(t *testing.T) {
+	e := testEstimator(16<<30, 16<<30)
+	_, err := e.Inverse(llamaModel(), 0, "f16", 0)
+	if err == nil {
+		t.Error("expected error for nParallel=0")
+	}
+}
+
+func TestInverse_NParallelNegative_Error(t *testing.T) {
+	e := testEstimator(16<<30, 16<<30)
+	_, err := e.Inverse(llamaModel(), 0, "f16", -1)
+	if err == nil {
+		t.Error("expected error for nParallel=-1")
 	}
 }
 

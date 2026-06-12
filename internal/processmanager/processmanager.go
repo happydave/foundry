@@ -42,6 +42,7 @@ type LoadedModel struct {
 	Port        int
 	ContextSize int
 	GPULayers   int
+	Parallel    int
 	LoadTime    time.Time
 
 	mu     sync.Mutex
@@ -96,6 +97,9 @@ type ModelLoadOptions struct {
 	// KVCacheType is the resolved KV cache element type for this model
 	// (e.g. "f16", "q8_0"). If empty, doLoad treats it as "q8_0".
 	KVCacheType string
+	// Parallel is the number of parallel KV cache slots to allocate. If 0,
+	// doLoad defaults to 1. Must be >= 1 after defaulting.
+	Parallel int
 }
 
 // CheckBinaryVersion runs binary --version, captures the combined stdout+stderr
@@ -248,6 +252,10 @@ func (m *Manager) doLoad(ctx context.Context, modelID uint64, modelPath, mmprojP
 	if kvType == "" {
 		kvType = "q8_0"
 	}
+	parallel := opts.Parallel
+	if parallel == 0 {
+		parallel = 1
+	}
 
 	args := []string{
 		"--model", modelPath,
@@ -257,6 +265,7 @@ func (m *Manager) doLoad(ctx context.Context, modelID uint64, modelPath, mmprojP
 		"--host", "127.0.0.1",
 		"--cache-type-k", kvType,
 		"--cache-type-v", kvType,
+		"--parallel", strconv.Itoa(parallel),
 	}
 	if mmprojPath != "" {
 		args = append(args, "--mmproj", mmprojPath)
@@ -315,6 +324,7 @@ func (m *Manager) doLoad(ctx context.Context, modelID uint64, modelPath, mmprojP
 		Port:        port,
 		ContextSize: contextSize,
 		GPULayers:   gpuLayers,
+		Parallel:    parallel,
 		LoadTime:    time.Now(),
 		health:      HealthStatusHealthy,
 	}

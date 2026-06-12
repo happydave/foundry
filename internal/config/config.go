@@ -28,6 +28,7 @@ type ModelConfig struct {
 	ChatTemplate     string `yaml:"chat_template"`
 	ChatTemplateFile string `yaml:"chat_template_file"`
 	KVCacheType      string `yaml:"kv_cache_type"`
+	Parallel         int    `yaml:"parallel"`
 }
 
 type Config struct {
@@ -36,6 +37,7 @@ type Config struct {
 	LlamaServerExtraArgs []string               `yaml:"llama_server_extra_args"`
 	DefaultGPULayers     int                    `yaml:"default_gpu_layers"`
 	KVCacheType          string                 `yaml:"kv_cache_type"`
+	Parallel             int                    `yaml:"parallel"`
 	HistorySessionsDir   string                 `yaml:"history_sessions_dir"`
 	ListenAddress        string                 `yaml:"listen_address"`
 	LogLevel             string                 `yaml:"log_level"`
@@ -69,6 +71,9 @@ func Load(path string) (*Config, error) {
 	if cfg.KVCacheType == "" {
 		cfg.KVCacheType = "q8_0"
 	}
+	if cfg.Parallel == 0 {
+		cfg.Parallel = 1
+	}
 
 	return &cfg, nil
 }
@@ -87,12 +92,18 @@ func (c *Config) validate() error {
 	if c.KVCacheType != "" && !validKVCacheTypes[c.KVCacheType] {
 		errs = append(errs, fmt.Errorf("kv_cache_type %q is not supported; must be one of: f32, f16, bf16, q8_0, q4_0, q4_1, iq4_nl, q5_0, q5_1", c.KVCacheType))
 	}
+	if c.Parallel < 0 {
+		errs = append(errs, fmt.Errorf("parallel must be >= 1 (or 0 to use default); got %d", c.Parallel))
+	}
 	for name, mc := range c.Models {
 		if strings.TrimSpace(mc.ChatTemplate) != "" && strings.TrimSpace(mc.ChatTemplateFile) != "" {
 			errs = append(errs, fmt.Errorf("model %q: chat_template and chat_template_file are mutually exclusive", name))
 		}
 		if mc.KVCacheType != "" && !validKVCacheTypes[mc.KVCacheType] {
 			errs = append(errs, fmt.Errorf("model %q: kv_cache_type %q is not supported; must be one of: f32, f16, bf16, q8_0, q4_0, q4_1, iq4_nl, q5_0, q5_1", name, mc.KVCacheType))
+		}
+		if mc.Parallel < 0 {
+			errs = append(errs, fmt.Errorf("model %q: parallel must be >= 1 (or 0 to use default); got %d", name, mc.Parallel))
 		}
 	}
 	return errors.Join(errs...)

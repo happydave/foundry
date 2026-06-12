@@ -60,6 +60,7 @@ func New(params Params) *Estimator {
 // returns a feasibility verdict against currently available resources.
 // kvType is the KV cache element type (e.g. "f16", "q8_0"); unrecognised or
 // empty values default to f16.
+// nParallel is the number of parallel KV cache slots (must be >= 1).
 //
 // inUseBytes is the total VRAM currently consumed by loaded llama-server
 // instances. The caller (Process Manager) is responsible for providing this
@@ -67,7 +68,7 @@ func New(params Params) *Estimator {
 //
 // If ctxLen exceeds the model's native MaxContext, it is clamped to
 // MaxContext before estimation proceeds.
-func (e *Estimator) Forward(model ModelSpec, ctxLen uint32, inUseBytes uint64, kvType string) (ForwardResult, error) {
+func (e *Estimator) Forward(model ModelSpec, ctxLen uint32, inUseBytes uint64, kvType string, nParallel int) (ForwardResult, error) {
 	if ctxLen == 0 {
 		return ForwardResult{}, errors.New("context size must be positive")
 	}
@@ -76,6 +77,9 @@ func (e *Estimator) Forward(model ModelSpec, ctxLen uint32, inUseBytes uint64, k
 	}
 	if model.HeadDim == 0 {
 		return ForwardResult{}, errors.New("model head dimension must be positive")
+	}
+	if nParallel < 1 {
+		return ForwardResult{}, fmt.Errorf("nParallel must be >= 1, got %d", nParallel)
 	}
 
 	// Clamp to native max context.
@@ -89,7 +93,7 @@ func (e *Estimator) Forward(model ModelSpec, ctxLen uint32, inUseBytes uint64, k
 	}
 
 	weightCost := uint64(model.FileSize)
-	kvCost := kvCacheBytes(model, ctxLen, kvBytesPerElement(kvType))
+	kvCost := kvCacheBytes(model, ctxLen, kvBytesPerElement(kvType)) * uint64(nParallel)
 	totalCost := weightCost + kvCost
 
 	budget := effectiveBudget(vramAvail, ramAvail, inUseBytes)
@@ -107,18 +111,22 @@ func (e *Estimator) Forward(model ModelSpec, ctxLen uint32, inUseBytes uint64, k
 // for the given model.
 // kvType is the KV cache element type (e.g. "f16", "q8_0"); unrecognised or
 // empty values default to f16.
+// nParallel is the number of parallel KV cache slots (must be >= 1).
 //
 // inUseBytes is the total VRAM currently consumed by loaded llama-server
 // instances.
 //
 // Returns MaxContext=0 if the model's weights alone exceed the effective memory
 // budget (model does not fit at any context size).
-func (e *Estimator) Inverse(model ModelSpec, inUseBytes uint64, kvType string) (InverseResult, error) {
+func (e *Estimator) Inverse(model ModelSpec, inUseBytes uint64, kvType string, nParallel int) (InverseResult, error) {
 	if model.KVHeadCount == 0 {
 		return InverseResult{}, errors.New("model KV head count must be positive")
 	}
 	if model.HeadDim == 0 {
 		return InverseResult{}, errors.New("model head dimension must be positive")
+	}
+	if nParallel < 1 {
+		return InverseResult{}, fmt.Errorf("nParallel must be >= 1, got %d", nParallel)
 	}
 
 	vramAvail, ramAvail, err := e.queryResFunc()
@@ -136,7 +144,7 @@ func (e *Estimator) Inverse(model ModelSpec, inUseBytes uint64, kvType string) (
 	}
 
 	kvBudget := conservativeBudget - weightCost
-	bytesPerCtx := kvCacheBytesPerToken(model, kvBytesPerElement(kvType))
+	bytesPerCtx := kvCacheBytesPerToken(model, kvBytesPerElement(kvType)) * uint64(nParallel)
 	if bytesPerCtx == 0 {
 		return InverseResult{}, errors.New("KV cache cost per token is zero; cannot compute inverse")
 	}

@@ -553,6 +553,129 @@ func TestCheckBinaryVersion_BinaryNotFound(t *testing.T) {
 	}
 }
 
+func TestLoad_ParallelFlag_ExplicitValue(t *testing.T) {
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	m := New(os.Args[0], nil, logger)
+
+	var capturedArgs []string
+	m.newCmd = func(_ string, args ...string) *exec.Cmd {
+		capturedArgs = append(capturedArgs[:0], args...)
+		cmd := exec.Command(os.Args[0], args...)
+		cmd.Env = append(os.Environ(), helperEnvKey+"=healthy")
+		return cmd
+	}
+
+	ctx := context.Background()
+	opts := ModelLoadOptions{Parallel: 4}
+	rec, err := m.Load(ctx, 1, "/fake/model.gguf", "", 4096, 32, opts)
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	_ = m.Unload(ctx, rec.ModelID)
+
+	findFlag := func(flag, value string) bool {
+		for i, arg := range capturedArgs {
+			if arg == flag && i+1 < len(capturedArgs) && capturedArgs[i+1] == value {
+				return true
+			}
+		}
+		return false
+	}
+	if !findFlag("--parallel", "4") {
+		t.Errorf("--parallel 4 not found in subprocess args: %v", capturedArgs)
+	}
+	if rec.Parallel != 4 {
+		t.Errorf("LoadedModel.Parallel = %d, want 4", rec.Parallel)
+	}
+}
+
+func TestLoad_ParallelFlag_ZeroDefaultsToOne(t *testing.T) {
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	m := New(os.Args[0], nil, logger)
+
+	var capturedArgs []string
+	m.newCmd = func(_ string, args ...string) *exec.Cmd {
+		capturedArgs = append(capturedArgs[:0], args...)
+		cmd := exec.Command(os.Args[0], args...)
+		cmd.Env = append(os.Environ(), helperEnvKey+"=healthy")
+		return cmd
+	}
+
+	ctx := context.Background()
+	rec, err := m.Load(ctx, 1, "/fake/model.gguf", "", 4096, 32, ModelLoadOptions{})
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	_ = m.Unload(ctx, rec.ModelID)
+
+	findFlag := func(flag, value string) bool {
+		for i, arg := range capturedArgs {
+			if arg == flag && i+1 < len(capturedArgs) && capturedArgs[i+1] == value {
+				return true
+			}
+		}
+		return false
+	}
+	if !findFlag("--parallel", "1") {
+		t.Errorf("--parallel 1 not found when Parallel is 0 (default): %v", capturedArgs)
+	}
+	if rec.Parallel != 1 {
+		t.Errorf("LoadedModel.Parallel = %d, want 1 (default)", rec.Parallel)
+	}
+}
+
+func TestLoad_ParallelFlag_BeforePerModelAndGlobalArgs(t *testing.T) {
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	m := New(os.Args[0], []string{"--global-flag"}, logger)
+
+	var capturedArgs []string
+	m.newCmd = func(_ string, args ...string) *exec.Cmd {
+		capturedArgs = append(capturedArgs[:0], args...)
+		cmd := exec.Command(os.Args[0], args...)
+		cmd.Env = append(os.Environ(), helperEnvKey+"=healthy")
+		return cmd
+	}
+
+	ctx := context.Background()
+	opts := ModelLoadOptions{
+		Parallel: 2,
+		Args:     []string{"--chat-template-file", "/tmpl.jinja"},
+	}
+	rec, err := m.Load(ctx, 1, "/fake/model.gguf", "", 4096, 32, opts)
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	_ = m.Unload(ctx, rec.ModelID)
+
+	parallelIdx, perModelIdx, globalIdx := -1, -1, -1
+	for i, arg := range capturedArgs {
+		if arg == "--parallel" {
+			parallelIdx = i
+		}
+		if arg == "--chat-template-file" {
+			perModelIdx = i
+		}
+		if arg == "--global-flag" {
+			globalIdx = i
+		}
+	}
+	if parallelIdx == -1 {
+		t.Fatal("--parallel not found in subprocess args")
+	}
+	if perModelIdx == -1 {
+		t.Fatal("--chat-template-file not found in subprocess args")
+	}
+	if globalIdx == -1 {
+		t.Fatal("--global-flag not found in subprocess args")
+	}
+	if parallelIdx > perModelIdx {
+		t.Errorf("--parallel (idx %d) must appear before per-model arg (idx %d)", parallelIdx, perModelIdx)
+	}
+	if parallelIdx > globalIdx {
+		t.Errorf("--parallel (idx %d) must appear before global extra arg (idx %d)", parallelIdx, globalIdx)
+	}
+}
+
 type captureWriter struct{ fn func(string) }
 
 func (w *captureWriter) Write(p []byte) (int, error) {

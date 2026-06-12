@@ -60,7 +60,11 @@ func main() {
 		if kvType == "" {
 			kvType = cfg.KVCacheType
 		}
-		opts := processmanager.ModelLoadOptions{KVCacheType: kvType}
+		parallel := mc.Parallel
+		if parallel == 0 {
+			parallel = cfg.Parallel
+		}
+		opts := processmanager.ModelLoadOptions{KVCacheType: kvType, Parallel: parallel}
 		if f := strings.TrimSpace(mc.ChatTemplateFile); f != "" {
 			opts.Args = []string{"--chat-template-file", f}
 		} else if t := strings.TrimSpace(mc.ChatTemplate); t != "" {
@@ -69,7 +73,7 @@ func main() {
 		resolvedOpts[name] = opts
 	}
 
-	srv := server.New(cfg.ListenAddress, reg, pm, est, cfg.DefaultGPULayers, cfg.KVCacheType, resolvedOpts, logger)
+	srv := server.New(cfg.ListenAddress, reg, pm, est, cfg.DefaultGPULayers, cfg.KVCacheType, cfg.Parallel, resolvedOpts, logger)
 
 	if fi, err := os.Stat(cfg.HistorySessionsDir); err != nil || !fi.IsDir() {
 		logger.Warn("history_sessions_dir does not exist or is not a directory; persistent session history is disabled",

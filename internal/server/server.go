@@ -35,8 +35,8 @@ type processManager interface {
 
 // resourceEstimator is the subset of estimator.Estimator used by the server.
 type resourceEstimator interface {
-	Forward(model estimator.ModelSpec, ctxLen uint32, inUseBytes uint64, kvType string) (estimator.ForwardResult, error)
-	Inverse(model estimator.ModelSpec, inUseBytes uint64, kvType string) (estimator.InverseResult, error)
+	Forward(model estimator.ModelSpec, ctxLen uint32, inUseBytes uint64, kvType string, nParallel int) (estimator.ForwardResult, error)
+	Inverse(model estimator.ModelSpec, inUseBytes uint64, kvType string, nParallel int) (estimator.InverseResult, error)
 }
 
 type Server struct {
@@ -46,10 +46,11 @@ type Server struct {
 	estimator         resourceEstimator
 	defaultGPULayers  int
 	globalKVCacheType string
+	globalParallel    int
 	// resolvedModelOpts maps DisplayName to pre-resolved per-model load options
 	// (KV cache type already resolved against the global default, Args populated
 	// from chat-template config). Models absent from the map use globalKVCacheType
-	// and no extra args.
+	// and globalParallel.
 	resolvedModelOpts map[string]processmanager.ModelLoadOptions
 	logger            *slog.Logger
 
@@ -64,18 +65,17 @@ type Server struct {
 	queryVRAMTotal func() (uint64, error)
 }
 
-func New(addr string, reg *registry.Registry, pm *processmanager.Manager, est *estimator.Estimator, defaultGPULayers int, globalKVCacheType string, resolvedModelOpts map[string]processmanager.ModelLoadOptions, logger *slog.Logger) *Server {
-	return newServer(addr, reg, pm, est, defaultGPULayers, globalKVCacheType, resolvedModelOpts, logger)
+func New(addr string, reg *registry.Registry, pm *processmanager.Manager, est *estimator.Estimator, defaultGPULayers int, globalKVCacheType string, globalParallel int, resolvedModelOpts map[string]processmanager.ModelLoadOptions, logger *slog.Logger) *Server {
+	return newServer(addr, reg, pm, est, defaultGPULayers, globalKVCacheType, globalParallel, resolvedModelOpts, logger)
 }
 
 // resolveOpts returns the ModelLoadOptions for the given model DisplayName.
-// Models not in resolvedModelOpts fall back to an options value carrying only
-// the global KV cache type.
+// Models not in resolvedModelOpts fall back to the global KV cache type and parallel.
 func (s *Server) resolveOpts(displayName string) processmanager.ModelLoadOptions {
 	if opts, ok := s.resolvedModelOpts[displayName]; ok {
 		return opts
 	}
-	return processmanager.ModelLoadOptions{KVCacheType: s.globalKVCacheType}
+	return processmanager.ModelLoadOptions{KVCacheType: s.globalKVCacheType, Parallel: s.globalParallel}
 }
 
 // SetHistoryStore attaches a history store to the server, enabling persistent
@@ -84,13 +84,14 @@ func (s *Server) SetHistoryStore(store history.Store) {
 	s.historyStore = store
 }
 
-func newServer(addr string, reg modelRegistry, pm processManager, est resourceEstimator, defaultGPULayers int, globalKVCacheType string, resolvedModelOpts map[string]processmanager.ModelLoadOptions, logger *slog.Logger) *Server {
+func newServer(addr string, reg modelRegistry, pm processManager, est resourceEstimator, defaultGPULayers int, globalKVCacheType string, globalParallel int, resolvedModelOpts map[string]processmanager.ModelLoadOptions, logger *slog.Logger) *Server {
 	s := &Server{
 		registry:          reg,
 		procMgr:           pm,
 		estimator:         est,
 		defaultGPULayers:  defaultGPULayers,
 		globalKVCacheType: globalKVCacheType,
+		globalParallel:    globalParallel,
 		resolvedModelOpts: resolvedModelOpts,
 		logger:            logger,
 		queryResources:    estimator.QueryResources,
@@ -154,20 +155,6 @@ func (s *Server) ListenAndServe(ctx context.Context) error {
 
 type apiError struct {
 	Error string `json:"error"`
-}
-
-type modelListEntry struct {
-	ID           uint64 `json:"id"`
-	DisplayName  string `json:"display_name"`
-	Path         string `json:"path"`
-	FileSize     int64  `json:"file_size"`
-	Architecture string `json:"architecture"`
-	LayerCount   uint32 `json:"layer_count"`
-	KVHeadCount  uint32 `json:"kv_head_count"`
-	HeadDim      uint32 `json:"head_dim"`
-	MaxContext   uint32 `json:"max_context"`
-	Quantization string `json:"quantization"`
-	Loaded       bool   `json:"loaded"`
 }
 
 type estimateResponse struct {
@@ -277,24 +264,36 @@ func loadedModelResp(lm *processmanager.LoadedModel) loadedModelResponse {
 
 func (s *Server) handleListModels(w http.ResponseWriter, r *http.Request) {
 	models := s.registry.List()
-	entries := make([]modelListEntry, len(models))
+	entries := make([]lmsModelEntry, len(models))
 	for i, m := range models {
-		_, loaded := s.procMgr.Get(m.ID)
-		entries[i] = modelListEntry{
-			ID:           m.ID,
-			DisplayName:  m.DisplayName,
-			Path:         m.Path,
-			FileSize:     m.FileSize,
-			Architecture: m.Architecture,
-			LayerCount:   m.LayerCount,
-			KVHeadCount:  m.KVHeadCount,
-			HeadDim:      m.HeadDim,
-			MaxContext:   m.MaxContext,
-			Quantization: m.Quantization,
-			Loaded:       loaded,
+		instances := make([]lmsLoadedInstance, 0)
+		if lm, loaded := s.procMgr.Get(m.ID); loaded {
+			instances = append(instances, lmsLoadedInstance{
+				ID: m.DisplayName,
+				Config: lmsInstanceConfig{
+					ContextLength:  lm.ContextSize,
+					EvalBatchSize:  512,
+					FlashAttention: false,
+					Parallel:       lm.Parallel,
+				},
+			})
+		}
+		entries[i] = lmsModelEntry{
+			Key:           m.DisplayName,
+			Type:          "llm",
+			Publisher:     "",
+			DisplayName:   m.DisplayName,
+			Architecture:  m.Architecture,
+			SizeBytes:     m.FileSize,
+			ContextLength: m.MaxContext,
+			Quantization: lmsQuantization{
+				Name:          m.Quantization,
+				BitsPerWeight: bitsPerWeight(m.Quantization),
+			},
+			LoadedInstances: instances,
 		}
 	}
-	writeJSON(w, http.StatusOK, entries)
+	writeJSON(w, http.StatusOK, lmsModelsResponse{Models: entries})
 }
 
 func (s *Server) handleGetModel(w http.ResponseWriter, r *http.Request) {
@@ -309,15 +308,15 @@ func (s *Server) handleGetModel(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	kvType := s.resolveOpts(m.DisplayName).KVCacheType
+	opts := s.resolveOpts(m.DisplayName)
 	spec := modelSpec(m)
-	fwd, err := s.estimator.Forward(spec, m.MaxContext, 0, kvType)
+	fwd, err := s.estimator.Forward(spec, m.MaxContext, 0, opts.KVCacheType, opts.Parallel)
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, fmt.Sprintf("resource estimation failed: %v", err))
 		return
 	}
 
-	inv, err := s.estimator.Inverse(spec, 0, kvType)
+	inv, err := s.estimator.Inverse(spec, 0, opts.KVCacheType, opts.Parallel)
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, fmt.Sprintf("resource estimation failed: %v", err))
 		return
@@ -375,7 +374,7 @@ func (s *Server) handleLoadModel(w http.ResponseWriter, r *http.Request) {
 
 	ctxSize := req.Ctx
 	if ctxSize <= 0 {
-		inv, err := s.estimator.Inverse(spec, 0, opts.KVCacheType)
+		inv, err := s.estimator.Inverse(spec, 0, opts.KVCacheType, opts.Parallel)
 		if err != nil {
 			writeError(w, http.StatusInternalServerError, fmt.Sprintf("resource estimation failed: %v", err))
 			return
@@ -390,7 +389,7 @@ func (s *Server) handleLoadModel(w http.ResponseWriter, r *http.Request) {
 		if m.MaxContext > 0 && ctxSize > int(m.MaxContext) {
 			ctxSize = int(m.MaxContext)
 		}
-		fwd, err := s.estimator.Forward(spec, uint32(ctxSize), 0, opts.KVCacheType)
+		fwd, err := s.estimator.Forward(spec, uint32(ctxSize), 0, opts.KVCacheType, opts.Parallel)
 		if err != nil {
 			writeError(w, http.StatusInternalServerError, fmt.Sprintf("resource estimation failed: %v", err))
 			return
@@ -457,9 +456,9 @@ func (s *Server) handleEstimate(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	kvType := s.resolveOpts(m.DisplayName).KVCacheType
+	estOpts := s.resolveOpts(m.DisplayName)
 	spec := modelSpec(m)
-	fwd, err := s.estimator.Forward(spec, uint32(ctxVal), 0, kvType)
+	fwd, err := s.estimator.Forward(spec, uint32(ctxVal), 0, estOpts.KVCacheType, estOpts.Parallel)
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, fmt.Sprintf("resource estimation failed: %v", err))
 		return

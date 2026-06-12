@@ -43,6 +43,11 @@ default_gpu_layers: 99
 # KV cache element type for all models: f16, bf16, f32, q8_0 (optional; default: q8_0)
 kv_cache_type: q8_0
 
+# Number of parallel inference slots (optional; default: 1).
+# Controls llama-server's --parallel flag. 1 maximises context window size for single-user use.
+# Increase only if you need concurrent multi-user inference.
+parallel: 1
+
 # Directory for persistent session history files (required).
 # If the directory does not exist at startup, session history is disabled with a warning.
 history_sessions_dir: /var/lib/foundry/sessions
@@ -64,6 +69,9 @@ log_level: info
 #   my-model-name:
 #     # Override the global kv_cache_type for this model only (same values: f16, bf16, f32, q8_0).
 #     # kv_cache_type: f16
+#
+#     # Override the global parallel for this model only (integer >= 1).
+#     # parallel: 4
 #
 #     # Override the Jinja2 chat template embedded in the model's GGUF.
 #     # Use chat_template_file to supply the template from a file (recommended for
@@ -100,7 +108,7 @@ Foundry logs to stdout in JSON format. `llama-server` subprocess output is captu
 
 Each model is identified by its **display name** — the GGUF filename without the `.gguf` extension. For example, `/models/llama-3.2-3b-instruct-q4_k_m.gguf` has display name `llama-3.2-3b-instruct-q4_k_m`.
 
-Use the display name as the `model` field in inference requests and as the `{id}` parameter in management API calls that take a numeric ID. The numeric ID is the stable internal fingerprint returned by `GET /api/v1/models`.
+Use the display name as the `model` field in inference requests. Management API endpoints (`/api/v1/models/{id}/load`, etc.) take a numeric model ID — an FNV-64a fingerprint of the file's absolute path and size. For currently loaded models, the numeric ID is available from `GET /api/v1/status`.
 
 ## OpenAI-compatible inference API
 
@@ -215,7 +223,9 @@ GET /api/v1/models
 GET /api/v1/models/{id}
 ```
 
-Lists all models found at startup with metadata (architecture, layer count, context length, quantization) and load status. The detail endpoint also includes a resource estimate at native max context and the estimated maximum loadable context given current VRAM availability.
+`GET /api/v1/models` returns all models found at startup in LM Studio-compatible format (`{ "models": [...] }`). Each entry contains `key` (equals `display_name`), `type`, `architecture`, `size_bytes`, `context_length`, `quantization` (object with `name` and `bits_per_weight`), and `loaded_instances` (non-null array, non-empty when the model is running). This endpoint is compatible with LM Studio clients such as lmstudio-for-copilot.
+
+`GET /api/v1/models/{id}` takes a numeric model ID and returns detailed metadata plus a resource estimate at native max context and the estimated maximum loadable context given current VRAM availability.
 
 ### Model lifecycle
 

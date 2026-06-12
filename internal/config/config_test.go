@@ -328,3 +328,128 @@ models:
 		})
 	}
 }
+
+func TestLoad_Parallel_AbsentDefaultsToOne(t *testing.T) {
+	path := writeTemp(t, `
+model_scan_paths: [/m]
+llama_server_binary: /bin/llama
+history_sessions_dir: /s
+`)
+	cfg, err := Load(path)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if cfg.Parallel != 1 {
+		t.Errorf("Parallel = %d, want 1 when absent", cfg.Parallel)
+	}
+}
+
+func TestLoad_Parallel_ExplicitZeroDefaultsToOne(t *testing.T) {
+	path := writeTemp(t, `
+model_scan_paths: [/m]
+llama_server_binary: /bin/llama
+history_sessions_dir: /s
+parallel: 0
+`)
+	cfg, err := Load(path)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if cfg.Parallel != 1 {
+		t.Errorf("Parallel = %d, want 1 when set to 0", cfg.Parallel)
+	}
+}
+
+func TestLoad_Parallel_ExplicitValue(t *testing.T) {
+	path := writeTemp(t, `
+model_scan_paths: [/m]
+llama_server_binary: /bin/llama
+history_sessions_dir: /s
+parallel: 4
+`)
+	cfg, err := Load(path)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if cfg.Parallel != 4 {
+		t.Errorf("Parallel = %d, want 4", cfg.Parallel)
+	}
+}
+
+func TestLoad_Parallel_NegativeRejected(t *testing.T) {
+	path := writeTemp(t, `
+model_scan_paths: [/m]
+llama_server_binary: /bin/llama
+history_sessions_dir: /s
+parallel: -1
+`)
+	_, err := Load(path)
+	if err == nil {
+		t.Fatal("expected error for negative parallel, got nil")
+	}
+	if got := err.Error(); !strings.Contains(got, "parallel") {
+		t.Errorf("error %q does not mention parallel", got)
+	}
+}
+
+func TestLoad_ModelConfig_Parallel_ExplicitValue(t *testing.T) {
+	path := writeTemp(t, `
+model_scan_paths: [/m]
+llama_server_binary: /bin/llama
+history_sessions_dir: /s
+parallel: 2
+models:
+  my-model:
+    parallel: 3
+`)
+	cfg, err := Load(path)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if cfg.Models["my-model"].Parallel != 3 {
+		t.Errorf("per-model Parallel = %d, want 3", cfg.Models["my-model"].Parallel)
+	}
+	if cfg.Parallel != 2 {
+		t.Errorf("global Parallel = %d, want 2", cfg.Parallel)
+	}
+}
+
+func TestLoad_ModelConfig_Parallel_AbsentMeansUseGlobal(t *testing.T) {
+	path := writeTemp(t, `
+model_scan_paths: [/m]
+llama_server_binary: /bin/llama
+history_sessions_dir: /s
+parallel: 2
+models:
+  my-model:
+    kv_cache_type: f16
+`)
+	cfg, err := Load(path)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if cfg.Models["my-model"].Parallel != 0 {
+		t.Errorf("per-model Parallel = %d, want 0 (absent; uses global)", cfg.Models["my-model"].Parallel)
+	}
+}
+
+func TestLoad_ModelConfig_Parallel_NegativeRejected(t *testing.T) {
+	path := writeTemp(t, `
+model_scan_paths: [/m]
+llama_server_binary: /bin/llama
+history_sessions_dir: /s
+models:
+  my-model:
+    parallel: -1
+`)
+	_, err := Load(path)
+	if err == nil {
+		t.Fatal("expected error for negative per-model parallel, got nil")
+	}
+	if got := err.Error(); !strings.Contains(got, "my-model") {
+		t.Errorf("error %q does not identify the model name", got)
+	}
+	if got := err.Error(); !strings.Contains(got, "parallel") {
+		t.Errorf("error %q does not mention parallel", got)
+	}
+}

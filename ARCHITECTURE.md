@@ -25,7 +25,7 @@ Required: /internal/registry/ is populated once at startup and treated as read-o
 
 - **Config** `/internal/config/`
   - Inputs: YAML config file path (filesystem read)
-  - Outputs: `*Config` struct with validated fields; default-filled `ListenAddress`, `LogLevel`, `KVCacheType`
+  - Outputs: `*Config` struct with validated fields; default-filled `ListenAddress`, `LogLevel`, `KVCacheType` (q8_0), `Parallel` (1)
 
 - **Registry** `/internal/registry/`
   - Inputs: filesystem scan of configured GGUF directories at startup; reads GGUF binary headers via `/internal/registry/gguf.go`
@@ -33,13 +33,13 @@ Required: /internal/registry/ is populated once at startup and treated as read-o
   - Note: ID is an FNV-64a hash of absolute path + file size; mmproj files are associated with text models in the same directory
 
 - **Estimator** `/internal/estimator/`
-  - Inputs: `ModelSpec` (file size, layer count, KV head count, head dim, max context), context size, KV cache type, in-use VRAM bytes; reads `/sys/class/drm/card*/device/mem_info_vram_{total,used}` and `/proc/meminfo` via `resources.go`
+  - Inputs: `ModelSpec` (file size, layer count, KV head count, head dim, max context), context size, KV cache type, `nParallel` (number of parallel slots), in-use VRAM bytes; reads `/sys/class/drm/card*/device/mem_info_vram_{total,used}` and `/proc/meminfo` via `resources.go`
   - Outputs: `ForwardResult` (weight cost, KV cost, total cost, feasibility); `InverseResult` (maximum fitting context size)
-  - Note: AMD GPU only; errors out if no DRM sysfs entries are found
+  - Note: KV cache cost is multiplied by `nParallel`; must match the `--parallel` value passed to llama-server. AMD GPU only; errors out if no DRM sysfs entries are found
 
 - **ProcessManager** `/internal/processmanager/`
-  - Inputs: model path, mmproj path, context size, GPU layers, `ModelLoadOptions` (KV cache type, extra args)
-  - Outputs: `*LoadedModel` (PID, port, context size, GPU layers, load time, health status); manages `llama-server` subprocess lifecycle with SIGTERM/SIGKILL shutdown
+  - Inputs: model path, mmproj path, context size, GPU layers, `ModelLoadOptions` (KV cache type, parallel slot count, extra args)
+  - Outputs: `*LoadedModel` (PID, port, context size, GPU layers, parallel slot count, load time, health status); manages `llama-server` subprocess lifecycle with SIGTERM/SIGKILL shutdown
   - Side-effects: spawns `llama-server` subprocess on a free loopback TCP port; polls `GET /health` until ready (up to 120 s); streams subprocess stdout/stderr into the structured logger; monitors for unexpected exits
 
 - **History** `/internal/history/`
@@ -52,6 +52,7 @@ Required: /internal/registry/ is populated once at startup and treated as read-o
   - Inputs: HTTP requests on configured listen address; `*registry.Registry`, `*processmanager.Manager`, `*estimator.Estimator`, `history.Store`, resolved per-model load options
   - Outputs: HTTP responses; side-effect: proxies inference requests to llama-server subprocesses; side-effect: writes session turns to history store
   - `server.go`: HTTP mux wiring, management API handlers (`/api/v1/`), JSON response types
+  - `lms.go`: LM Studio native API response types for `GET /api/v1/models`; `bitsPerWeight` quantization lookup table
   - `inference.go`: OpenAI and Anthropic inference proxy handlers (`/v1/`); `InferenceHook` extension point
   - `history_session.go`: session header parsing, history prepend, response capture, turn recording
 

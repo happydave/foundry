@@ -92,20 +92,20 @@ func (f *fakeProcMgr) Get(modelID uint64) (*processmanager.LoadedModel, bool) {
 }
 
 type fakeEstimator struct {
-	forwardFn func(model estimator.ModelSpec, ctxLen uint32, inUse uint64, kvType string) (estimator.ForwardResult, error)
-	inverseFn func(model estimator.ModelSpec, inUse uint64, kvType string) (estimator.InverseResult, error)
+	forwardFn func(model estimator.ModelSpec, ctxLen uint32, inUse uint64, kvType string, nParallel int) (estimator.ForwardResult, error)
+	inverseFn func(model estimator.ModelSpec, inUse uint64, kvType string, nParallel int) (estimator.InverseResult, error)
 }
 
-func (f *fakeEstimator) Forward(model estimator.ModelSpec, ctxLen uint32, inUse uint64, kvType string) (estimator.ForwardResult, error) {
+func (f *fakeEstimator) Forward(model estimator.ModelSpec, ctxLen uint32, inUse uint64, kvType string, nParallel int) (estimator.ForwardResult, error) {
 	if f.forwardFn != nil {
-		return f.forwardFn(model, ctxLen, inUse, kvType)
+		return f.forwardFn(model, ctxLen, inUse, kvType, nParallel)
 	}
 	return estimator.ForwardResult{TotalCost: 1 << 30, Feasible: true}, nil
 }
 
-func (f *fakeEstimator) Inverse(model estimator.ModelSpec, inUse uint64, kvType string) (estimator.InverseResult, error) {
+func (f *fakeEstimator) Inverse(model estimator.ModelSpec, inUse uint64, kvType string, nParallel int) (estimator.InverseResult, error) {
 	if f.inverseFn != nil {
-		return f.inverseFn(model, inUse, kvType)
+		return f.inverseFn(model, inUse, kvType, nParallel)
 	}
 	return estimator.InverseResult{MaxContext: 4096}, nil
 }
@@ -126,7 +126,7 @@ func newFixture(t *testing.T) *serverFixture {
 	pm := newFakeProcMgr()
 	est := &fakeEstimator{}
 
-	s := newServer("127.0.0.1:0", reg, pm, est, 35, "q8_0", nil, nil)
+	s := newServer("127.0.0.1:0", reg, pm, est, 35, "q8_0", 1, nil, nil)
 	s.queryResources = func() (uint64, uint64, error) { return 8 << 30, 8 << 30, nil }
 	s.queryVRAMTotal = func() (uint64, error) { return 16 << 30, nil }
 
@@ -214,37 +214,113 @@ func TestListModels_Empty(t *testing.T) {
 	f := newFixture(t)
 	resp := f.do(t, http.MethodGet, "/api/v1/models", nil)
 	assertStatus(t, resp, http.StatusOK)
-	entries := decodeBody[[]modelListEntry](t, resp)
-	if entries == nil {
+	mr := decodeBody[lmsModelsResponse](t, resp)
+	if mr.Models == nil {
 		t.Fatal("expected JSON array, got null")
 	}
-	if len(entries) != 0 {
-		t.Fatalf("expected empty array, got %d entries", len(entries))
+	if len(mr.Models) != 0 {
+		t.Fatalf("expected empty models array, got %d entries", len(mr.Models))
 	}
 }
 
 func TestListModels_LoadStatus(t *testing.T) {
 	f := newFixture(t)
 	m1 := testModel(1)
+	m1.DisplayName = "model-one"
 	m2 := testModel(2)
+	m2.DisplayName = "model-two"
 	f.reg.models = []registry.Model{m1, m2}
-	f.pm.loaded[m1.ID] = &processmanager.LoadedModel{ModelID: m1.ID}
+	f.pm.loaded[m1.ID] = &processmanager.LoadedModel{ModelID: m1.ID, ContextSize: 4096}
 
 	resp := f.do(t, http.MethodGet, "/api/v1/models", nil)
-	entries := decodeBody[[]modelListEntry](t, resp)
+	mr := decodeBody[lmsModelsResponse](t, resp)
 
-	if len(entries) != 2 {
-		t.Fatalf("expected 2 entries, got %d", len(entries))
+	if len(mr.Models) != 2 {
+		t.Fatalf("expected 2 entries, got %d", len(mr.Models))
 	}
-	byID := map[uint64]modelListEntry{}
-	for _, e := range entries {
-		byID[e.ID] = e
+	byKey := map[string]lmsModelEntry{}
+	for _, e := range mr.Models {
+		byKey[e.Key] = e
 	}
-	if !byID[m1.ID].Loaded {
-		t.Error("m1 should be loaded")
+	if len(byKey["model-one"].LoadedInstances) == 0 {
+		t.Error("model-one should have a loaded instance")
 	}
-	if byID[m2.ID].Loaded {
-		t.Error("m2 should not be loaded")
+	if len(byKey["model-two"].LoadedInstances) != 0 {
+		t.Error("model-two should not have loaded instances")
+	}
+}
+
+func TestListModels_Shape(t *testing.T) {
+	f := newFixture(t)
+	m := testModel(1)
+	f.reg.models = []registry.Model{m}
+
+	resp := f.do(t, http.MethodGet, "/api/v1/models", nil)
+	assertStatus(t, resp, http.StatusOK)
+	mr := decodeBody[lmsModelsResponse](t, resp)
+
+	if len(mr.Models) != 1 {
+		t.Fatalf("expected 1 model, got %d", len(mr.Models))
+	}
+	e := mr.Models[0]
+
+	if e.Key != m.DisplayName {
+		t.Errorf("key = %q, want %q", e.Key, m.DisplayName)
+	}
+	if e.DisplayName != m.DisplayName {
+		t.Errorf("display_name = %q, want %q", e.DisplayName, m.DisplayName)
+	}
+	if e.Key != e.DisplayName {
+		t.Errorf("key %q != display_name %q", e.Key, e.DisplayName)
+	}
+	if e.Type != "llm" {
+		t.Errorf("type = %q, want llm", e.Type)
+	}
+	if e.Architecture != m.Architecture {
+		t.Errorf("architecture = %q, want %q", e.Architecture, m.Architecture)
+	}
+	if e.SizeBytes != m.FileSize {
+		t.Errorf("size_bytes = %d, want %d", e.SizeBytes, m.FileSize)
+	}
+	if e.ContextLength != m.MaxContext {
+		t.Errorf("context_length = %d, want %d", e.ContextLength, m.MaxContext)
+	}
+	if e.Quantization.Name != m.Quantization {
+		t.Errorf("quantization.name = %q, want %q", e.Quantization.Name, m.Quantization)
+	}
+	if e.LoadedInstances == nil {
+		t.Error("loaded_instances must not be null when model is not loaded")
+	}
+}
+
+func TestListModels_LoadedInstanceFields(t *testing.T) {
+	f := newFixture(t)
+	m := testModel(1)
+	f.reg.models = []registry.Model{m}
+	f.pm.loaded[m.ID] = &processmanager.LoadedModel{ModelID: m.ID, ContextSize: 2048, Parallel: 1}
+
+	resp := f.do(t, http.MethodGet, "/api/v1/models", nil)
+	mr := decodeBody[lmsModelsResponse](t, resp)
+
+	if len(mr.Models) != 1 {
+		t.Fatalf("expected 1 model, got %d", len(mr.Models))
+	}
+	instances := mr.Models[0].LoadedInstances
+	if len(instances) != 1 {
+		t.Fatalf("expected 1 loaded instance, got %d", len(instances))
+	}
+	inst := instances[0]
+	if inst.ID != m.DisplayName {
+		t.Errorf("instance id = %q, want %q", inst.ID, m.DisplayName)
+	}
+	if inst.Config.ContextLength != 2048 {
+		t.Errorf("instance context_length = %d, want 2048", inst.Config.ContextLength)
+	}
+	if inst.Config.EvalBatchSize != 512 {
+		t.Errorf("instance eval_batch_size = %d, want 512", inst.Config.EvalBatchSize)
+	}
+	if inst.Config.Parallel != 1 {
+		t.Errorf("instance parallel = %d, want 1", inst.Config.Parallel)
 	}
 }
 
@@ -373,7 +449,7 @@ func TestLoadModel_InfeasibleContext_Returns422(t *testing.T) {
 	f := newFixture(t)
 	m := testModel(1)
 	f.reg.models = []registry.Model{m}
-	f.est.forwardFn = func(_ estimator.ModelSpec, _ uint32, _ uint64, _ string) (estimator.ForwardResult, error) {
+	f.est.forwardFn = func(_ estimator.ModelSpec, _ uint32, _ uint64, _ string, _ int) (estimator.ForwardResult, error) {
 		return estimator.ForwardResult{TotalCost: 100 << 30, Feasible: false}, nil
 	}
 
@@ -386,7 +462,7 @@ func TestLoadModel_NoMemory_Returns422(t *testing.T) {
 	f := newFixture(t)
 	m := testModel(1)
 	f.reg.models = []registry.Model{m}
-	f.est.inverseFn = func(_ estimator.ModelSpec, _ uint64, _ string) (estimator.InverseResult, error) {
+	f.est.inverseFn = func(_ estimator.ModelSpec, _ uint64, _ string, _ int) (estimator.InverseResult, error) {
 		return estimator.InverseResult{MaxContext: 0}, nil
 	}
 
@@ -568,7 +644,7 @@ func TestEstimate_Valid(t *testing.T) {
 	f := newFixture(t)
 	m := testModel(1)
 	f.reg.models = []registry.Model{m}
-	f.est.forwardFn = func(_ estimator.ModelSpec, ctxLen uint32, _ uint64, _ string) (estimator.ForwardResult, error) {
+	f.est.forwardFn = func(_ estimator.ModelSpec, ctxLen uint32, _ uint64, _ string, _ int) (estimator.ForwardResult, error) {
 		return estimator.ForwardResult{TotalCost: uint64(ctxLen) * 1024, Feasible: true}, nil
 	}
 
