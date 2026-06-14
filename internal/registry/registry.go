@@ -24,6 +24,16 @@ type Model struct {
 	MaxContext   uint32
 	Quantization string
 	MmprojPath   string
+
+	// Sliding-window (local) attention fields. Zero for models that use fully
+	// global attention. When SlidingWindowSize is non-zero, the KV cache estimate
+	// splits into a context-scaling global term and a fixed sliding-window term.
+	SlidingWindowSize uint32
+	SWAHeadDim        uint32
+	GlobalLayerCount  uint32
+	SWALayerCount     uint32
+	GlobalKVHeadCount uint32
+	SWAKVHeadCount    uint32
 }
 
 // Registry is the in-process catalogue of models discovered at startup. It is populated
@@ -195,6 +205,17 @@ func (r *Registry) parseModel(path string, logger *slog.Logger) (Model, bool, bo
 		return Model{}, false, false
 	}
 
+	// A sliding-window key was present but the per-layer derivation could not run
+	// (missing pattern, missing per-layer KV head array, or length mismatch). The
+	// model is still usable; estimation falls back to the conservative all-layers
+	// formula. Surface the condition so it is visible in logs.
+	if meta.hasSlidingWindow && meta.slidingWindowSize == 0 {
+		logger.Warn("sliding-window attention present but SWA derivation failed; using conservative all-layers KV estimate",
+			"path", path,
+			"architecture", arch,
+		)
+	}
+
 	base := filepath.Base(path)
 	displayName := strings.TrimSuffix(base, filepath.Ext(base))
 	id := fingerprint(path, fi.Size())
@@ -211,6 +232,13 @@ func (r *Registry) parseModel(path string, logger *slog.Logger) (Model, bool, bo
 		HeadDim:      headDim,
 		MaxContext:   meta.maxContext,
 		Quantization: fileTypeString(meta.fileType),
+
+		SlidingWindowSize: meta.slidingWindowSize,
+		SWAHeadDim:        meta.swaHeadDim,
+		GlobalLayerCount:  meta.globalLayerCount,
+		SWALayerCount:     meta.swaLayerCount,
+		GlobalKVHeadCount: meta.globalKVHeadCount,
+		SWAKVHeadCount:    meta.swaKVHeadCount,
 	}
 
 	return m, false, true

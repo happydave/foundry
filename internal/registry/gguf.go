@@ -171,13 +171,28 @@ type ggufMeta struct {
 	maxContext   uint32
 	fileType     uint32
 
-	hasArchitecture bool
-	hasLayerCount   bool
-	hasHeadCount    bool
-	hasKVHeadCount  bool
-	hasMaxContext   bool
-	hasFileType     bool
-	isMmproj        bool
+	// Sliding-window (local) attention fields. Populated for models such as
+	// Gemma 4 that alternate global and sliding-window attention blocks. When
+	// slidingWindowSize is zero the model is treated as fully global attention.
+	slidingWindowSize uint32 // from {arch}.attention.sliding_window (validated; 0 if derivation failed)
+	swaHeadDim        uint32 // from {arch}.attention.key_length_swa
+	globalLayerCount  uint32 // derived: count of global (non-SWA) blocks
+	swaLayerCount     uint32 // derived: count of SWA blocks
+	globalKVHeadCount uint32 // derived: KV head count for global blocks
+	swaKVHeadCount    uint32 // derived: KV head count for SWA blocks
+
+	// Scratch fields used only during derivation; not propagated past parseGGUF.
+	kvHeadCountArray     []uint32 // per-layer head_count_kv when stored as an array
+	slidingWindowPattern []bool   // per-layer flags: true = SWA block, false = global
+
+	hasArchitecture  bool
+	hasLayerCount    bool
+	hasHeadCount     bool
+	hasKVHeadCount   bool
+	hasMaxContext    bool
+	hasFileType      bool
+	hasSlidingWindow bool // true if attention.sliding_window key was present
+	isMmproj         bool
 }
 
 // parseGGUF reads the metadata section of the GGUF file at path and returns the fields
@@ -233,7 +248,45 @@ func parseGGUF(path string) (ggufMeta, error) {
 		}
 		applyMeta(&meta, key, val)
 	}
+	meta.deriveSWA()
 	return meta, nil
+}
+
+// deriveSWA populates the sliding-window attention fields from the per-layer
+// head_count_kv array and the sliding_window_pattern, both gathered during the
+// KV scan. The derivation requires that both arrays are present and their
+// lengths match the block count; otherwise the model is treated as fully global
+// attention (slidingWindowSize cleared to zero) so estimation falls back to the
+// conservative all-layers formula. hasSlidingWindow is left untouched so callers
+// can detect a failed derivation (key present but fields not derived).
+func (meta *ggufMeta) deriveSWA() {
+	if !meta.hasSlidingWindow {
+		return
+	}
+	n := int(meta.layerCount)
+	if n == 0 || len(meta.slidingWindowPattern) != n || len(meta.kvHeadCountArray) != n {
+		meta.slidingWindowSize = 0
+		return
+	}
+	var globalCount, swaCount, globalHeads, swaHeads uint32
+	for i := 0; i < n; i++ {
+		h := meta.kvHeadCountArray[i]
+		if meta.slidingWindowPattern[i] {
+			swaCount++
+			if h > swaHeads {
+				swaHeads = h
+			}
+		} else {
+			globalCount++
+			if h > globalHeads {
+				globalHeads = h
+			}
+		}
+	}
+	meta.globalLayerCount = globalCount
+	meta.swaLayerCount = swaCount
+	meta.globalKVHeadCount = globalHeads
+	meta.swaKVHeadCount = swaHeads
 }
 
 // applyMeta extracts known fields from a single KV pair and stores them in meta.
@@ -277,15 +330,30 @@ func applyMeta(meta *ggufMeta, key string, val any) {
 				meta.hasKVHeadCount = true
 			} else if arr, ok := val.([]any); ok && len(arr) > 0 {
 				// Some architectures (e.g. Gemma 4) store per-layer kv head counts as an
-				// array. Use the maximum value for a conservative memory estimate.
+				// array. Use the maximum value for a conservative memory estimate, and
+				// retain the full array for sliding-window attention derivation.
 				if v, ok := maxUint32FromArray(arr); ok {
 					meta.kvHeadCount = v
 					meta.hasKVHeadCount = true
 				}
+				meta.kvHeadCountArray = uint32SliceFromArray(arr)
 			}
 		case "attention.key_length":
 			if v, ok := toUint32(val); ok {
 				meta.headDim = v
+			}
+		case "attention.key_length_swa":
+			if v, ok := toUint32(val); ok {
+				meta.swaHeadDim = v
+			}
+		case "attention.sliding_window":
+			if v, ok := toUint32(val); ok {
+				meta.slidingWindowSize = v
+				meta.hasSlidingWindow = true
+			}
+		case "attention.sliding_window_pattern":
+			if arr, ok := val.([]any); ok {
+				meta.slidingWindowPattern = boolSliceFromArray(arr)
 			}
 		case "embedding_length":
 			if v, ok := toUint32(val); ok {
@@ -313,6 +381,31 @@ func maxUint32FromArray(arr []any) (uint32, bool) {
 		}
 	}
 	return max, found
+}
+
+// uint32SliceFromArray converts a []any of GGUF numeric values into a []uint32.
+// Elements that do not coerce to uint32 are stored as zero, preserving positional
+// alignment with the sliding-window pattern.
+func uint32SliceFromArray(arr []any) []uint32 {
+	out := make([]uint32, len(arr))
+	for i, item := range arr {
+		if v, ok := toUint32(item); ok {
+			out[i] = v
+		}
+	}
+	return out
+}
+
+// boolSliceFromArray converts a []any of GGUF bool values into a []bool.
+// Non-bool elements are stored as false.
+func boolSliceFromArray(arr []any) []bool {
+	out := make([]bool, len(arr))
+	for i, item := range arr {
+		if b, ok := item.(bool); ok {
+			out[i] = b
+		}
+	}
+	return out
 }
 
 // toUint32 coerces a GGUF numeric value to uint32 when it fits.

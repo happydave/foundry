@@ -238,6 +238,13 @@ func modelSpec(m registry.Model) estimator.ModelSpec {
 		KVHeadCount: m.KVHeadCount,
 		HeadDim:     m.HeadDim,
 		MaxContext:  m.MaxContext,
+
+		SlidingWindowSize: m.SlidingWindowSize,
+		SWAHeadDim:        m.SWAHeadDim,
+		GlobalLayerCount:  m.GlobalLayerCount,
+		SWALayerCount:     m.SWALayerCount,
+		GlobalKVHeadCount: m.GlobalKVHeadCount,
+		SWAKVHeadCount:    m.SWAKVHeadCount,
 	}
 }
 

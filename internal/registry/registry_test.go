@@ -49,8 +49,36 @@ func appendGGUFKV(buf []byte, kv testKV) []byte {
 		for _, item := range v {
 			buf = binary.LittleEndian.AppendUint32(buf, uint32(item))
 		}
+	case []bool:
+		buf = binary.LittleEndian.AppendUint32(buf, uint32(ggufTypeBool))
+		buf = binary.LittleEndian.AppendUint64(buf, uint64(len(v)))
+		for _, item := range v {
+			b := byte(0)
+			if item {
+				b = 1
+			}
+			buf = append(buf, b)
+		}
 	}
 	return buf
+}
+
+// repeatI32 returns a slice with pattern repeated n times (helper for per-layer arrays).
+func repeatI32(pattern []int32, n int) []int32 {
+	out := make([]int32, 0, len(pattern)*n)
+	for i := 0; i < n; i++ {
+		out = append(out, pattern...)
+	}
+	return out
+}
+
+// repeatBool returns a slice with pattern repeated n times (helper for per-layer arrays).
+func repeatBool(pattern []bool, n int) []bool {
+	out := make([]bool, 0, len(pattern)*n)
+	for i := 0; i < n; i++ {
+		out = append(out, pattern...)
+	}
+	return out
 }
 
 // writeTestGGUF writes a test GGUF file to dir with the given name and metadata.
@@ -260,6 +288,82 @@ func TestRegistry_Gemma4PerLayerKVHeads(t *testing.T) {
 	}
 	if models[0].KVHeadCount != 16 {
 		t.Errorf("KVHeadCount = %d, want 16 (max of per-layer array)", models[0].KVHeadCount)
+	}
+}
+
+func TestRegistry_Gemma4SWADerivation(t *testing.T) {
+	// Gemma 4 31B: 60 blocks in a repeating [T,T,T,T,T,F] sliding-window pattern
+	// with per-layer KV heads [16,16,16,16,16,4]. T = SWA block (16 heads),
+	// F = global block (4 heads). This yields 50 SWA blocks and 10 global blocks.
+	dir := t.TempDir()
+	kvs := []testKV{
+		{key: "general.architecture", vtype: ggufTypeString, val: "gemma4"},
+		{key: "general.file_type", vtype: ggufTypeUint32, val: uint32(15)}, // Q4_K_M
+		{key: "gemma4.block_count", vtype: ggufTypeUint32, val: uint32(60)},
+		{key: "gemma4.attention.head_count", vtype: ggufTypeUint32, val: uint32(32)},
+		{key: "gemma4.attention.head_count_kv", vtype: ggufTypeArray,
+			val: repeatI32([]int32{16, 16, 16, 16, 16, 4}, 10)},
+		{key: "gemma4.attention.key_length", vtype: ggufTypeUint32, val: uint32(512)},
+		{key: "gemma4.attention.key_length_swa", vtype: ggufTypeUint32, val: uint32(256)},
+		{key: "gemma4.attention.sliding_window", vtype: ggufTypeUint32, val: uint32(1024)},
+		{key: "gemma4.attention.sliding_window_pattern", vtype: ggufTypeArray,
+			val: repeatBool([]bool{true, true, true, true, true, false}, 10)},
+		{key: "gemma4.context_length", vtype: ggufTypeUint32, val: uint32(262144)},
+	}
+	writeTestGGUF(t, dir, "gemma4-31b.gguf", kvs)
+
+	reg := New([]string{dir}, silentLogger())
+	models := reg.List()
+	if len(models) != 1 {
+		t.Fatalf("expected Gemma 4 model to be registered, got %d models", len(models))
+	}
+	m := models[0]
+
+	checks := []struct {
+		name string
+		got  uint32
+		want uint32
+	}{
+		{"SlidingWindowSize", m.SlidingWindowSize, 1024},
+		{"GlobalLayerCount", m.GlobalLayerCount, 10},
+		{"SWALayerCount", m.SWALayerCount, 50},
+		{"GlobalKVHeadCount", m.GlobalKVHeadCount, 4},
+		{"SWAKVHeadCount", m.SWAKVHeadCount, 16},
+		{"HeadDim", m.HeadDim, 512},
+		{"SWAHeadDim", m.SWAHeadDim, 256},
+	}
+	for _, c := range checks {
+		if c.got != c.want {
+			t.Errorf("%s = %d, want %d", c.name, c.got, c.want)
+		}
+	}
+}
+
+func TestRegistry_SWADerivationFallback_MissingPattern(t *testing.T) {
+	// sliding_window present but no sliding_window_pattern array: derivation must
+	// abort and clear SlidingWindowSize, leaving the model usable as non-SWA.
+	dir := t.TempDir()
+	kvs := []testKV{
+		{key: "general.architecture", vtype: ggufTypeString, val: "gemma4"},
+		{key: "general.file_type", vtype: ggufTypeUint32, val: uint32(15)},
+		{key: "gemma4.block_count", vtype: ggufTypeUint32, val: uint32(60)},
+		{key: "gemma4.attention.head_count", vtype: ggufTypeUint32, val: uint32(32)},
+		{key: "gemma4.attention.head_count_kv", vtype: ggufTypeArray,
+			val: repeatI32([]int32{16, 16, 16, 16, 16, 4}, 10)},
+		{key: "gemma4.attention.key_length", vtype: ggufTypeUint32, val: uint32(512)},
+		{key: "gemma4.attention.sliding_window", vtype: ggufTypeUint32, val: uint32(1024)},
+		// sliding_window_pattern intentionally omitted.
+		{key: "gemma4.context_length", vtype: ggufTypeUint32, val: uint32(262144)},
+	}
+	writeTestGGUF(t, dir, "gemma4-broken.gguf", kvs)
+
+	reg := New([]string{dir}, silentLogger())
+	models := reg.List()
+	if len(models) != 1 {
+		t.Fatalf("expected model to register despite failed SWA derivation, got %d", len(models))
+	}
+	if models[0].SlidingWindowSize != 0 {
+		t.Errorf("SlidingWindowSize = %d, want 0 (derivation should have aborted)", models[0].SlidingWindowSize)
 	}
 }
 

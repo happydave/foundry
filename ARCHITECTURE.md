@@ -31,11 +31,13 @@ Required: /internal/registry/ is populated once at startup and treated as read-o
   - Inputs: filesystem scan of configured GGUF directories at startup; reads GGUF binary headers via `/internal/registry/gguf.go`
   - Outputs: `*Registry` (in-memory catalog of `Model` records indexed by stable uint64 ID); `List()`, `Get(id)`, `GetByName(name)`
   - Note: ID is an FNV-64a hash of absolute path + file size; mmproj files are associated with text models in the same directory
+  - Note: for models with sliding-window (local) attention (e.g. Gemma 4), `gguf.go` reads `attention.sliding_window`, `attention.sliding_window_pattern`, and `attention.key_length_swa`, then derives per-block global vs. SWA layer/head counts onto `Model`. If the pattern or per-layer KV-head array is missing or length-mismatched, the fields are left zero and the model is treated as fully global attention (a warning is logged)
 
 - **Estimator** `/internal/estimator/`
-  - Inputs: `ModelSpec` (file size, layer count, KV head count, head dim, max context), context size, KV cache type, `nParallel` (number of parallel slots), in-use VRAM bytes; reads `/sys/class/drm/card*/device/mem_info_vram_{total,used}` and `/proc/meminfo` via `resources.go`
+  - Inputs: `ModelSpec` (file size, layer count, KV head count, head dim, max context, plus sliding-window fields: window size, SWA head dim, and global/SWA layer and KV-head counts), context size, KV cache type, `nParallel` (number of parallel slots), in-use VRAM bytes; reads `/sys/class/drm/card*/device/mem_info_vram_{total,used}` and `/proc/meminfo` via `resources.go`
   - Outputs: `ForwardResult` (weight cost, KV cost, total cost, feasibility); `InverseResult` (maximum fitting context size)
   - Note: KV cache cost is multiplied by `nParallel`; must match the `--parallel` value passed to llama-server. AMD GPU only; errors out if no DRM sysfs entries are found
+  - Note: when `SlidingWindowSize > 0`, KV cost splits into a context-scaling global-block term plus a fixed SWA-block term bounded by the window size; `Inverse` solves this in two phases (subtract the fixed SWA cost when the answer exceeds the window, else divide the budget by the combined per-token cost). When `SlidingWindowSize == 0` the formula reduces to the original all-layers form
 
 - **ProcessManager** `/internal/processmanager/`
   - Inputs: model path, mmproj path, context size, GPU layers, `ModelLoadOptions` (KV cache type, parallel slot count, extra args)

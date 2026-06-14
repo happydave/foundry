@@ -35,6 +35,26 @@ func llamaModel() ModelSpec {
 	}
 }
 
+// gemma4Model returns a ModelSpec for the Gemma 4 31B model with sliding-window
+// attention, using the confirmed GGUF-derived values: 60 blocks split into 10
+// global blocks (4 KV heads, 512 head dim) and 50 SWA blocks (16 KV heads, 256
+// head dim) with a 1024-token sliding window and 262144 native context.
+func gemma4Model() ModelSpec {
+	return ModelSpec{
+		FileSize:          20 << 30, // ~20 GiB representative weight size
+		LayerCount:        60,       // not used by estimator when SlidingWindowSize > 0
+		KVHeadCount:       16,       // max of per-layer array; unused on SWA path
+		HeadDim:           512,      // global block head dim (key_length)
+		MaxContext:        262144,
+		SlidingWindowSize: 1024,
+		SWAHeadDim:        256,
+		GlobalLayerCount:  10,
+		SWALayerCount:     50,
+		GlobalKVHeadCount: 4,
+		SWAKVHeadCount:    16,
+	}
+}
+
 // --- Forward tests ---
 
 func TestForward_Formula(t *testing.T) {
@@ -455,6 +475,127 @@ func TestInverse_NParallelNegative_Error(t *testing.T) {
 	_, err := e.Inverse(llamaModel(), 0, "f16", -1)
 	if err == nil {
 		t.Error("expected error for nParallel=-1")
+	}
+}
+
+// --- sliding-window attention (SWA) tests ---
+
+func TestForward_SWA_Formula_LargeContext(t *testing.T) {
+	model := gemma4Model() // SlidingWindowSize = 1024, MaxContext = 262144
+	// At ctx = 262144 (> window), the SWA term is bounded by the window:
+	//   global: 10 × 4 × 512 × 262144 × 2 elems
+	//   swa:    50 × 16 × 256 × 1024  × 2 elems  (min(ctx, 1024) = 1024)
+	// f16 = 2 bytes/elem.
+	wantKV := uint64(10*4*512*262144*2+50*16*256*1024*2) * 2
+
+	e := testEstimator(256<<30, 256<<30)
+	r, err := e.Forward(model, 262144, 0, "f16", 1)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if r.KVCost != wantKV {
+		t.Errorf("KVCost = %d, want %d (global scaling + fixed SWA window)", r.KVCost, wantKV)
+	}
+	if !r.Feasible {
+		t.Error("expected Feasible=true with ample memory")
+	}
+}
+
+func TestForward_SWA_Formula_SmallContext(t *testing.T) {
+	model := gemma4Model()
+	// At ctx = 512 (<= window 1024), the SWA term uses ctx, not the window size:
+	//   global: 10 × 4 × 512 × 512 × 2 elems
+	//   swa:    50 × 16 × 256 × 512 × 2 elems
+	wantKV := uint64(10*4*512*512*2+50*16*256*512*2) * 2
+
+	e := testEstimator(256<<30, 256<<30)
+	r, err := e.Forward(model, 512, 0, "f16", 1)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if r.KVCost != wantKV {
+		t.Errorf("KVCost = %d, want %d (both terms scale with ctx below window)", r.KVCost, wantKV)
+	}
+}
+
+func TestInverse_SWA_ReturnsNativeMax(t *testing.T) {
+	model := gemma4Model()
+	// 64 GiB comfortably fits the full 262144 context under the corrected formula
+	// (~47 GiB needed), but the pre-fix all-layers formula would have stopped well
+	// short (~19K context). The corrected Inverse must reach the native maximum.
+	e := testEstimator(64<<30, 0)
+	r, err := e.Inverse(model, 0, "f16", 1)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if r.MaxContext != 262144 {
+		t.Errorf("MaxContext = %d, want 262144 (native max; pre-fix formula yields ~19K)", r.MaxContext)
+	}
+}
+
+func TestInverse_SWA_ConsistentWithForward(t *testing.T) {
+	model := gemma4Model()
+	// Choose a budget that constrains the result below the native cap so the
+	// consistency check exercises a memory-bound answer, not the clamp.
+	model.MaxContext = 1 << 20 // avoid native-max clamp masking the test
+	e := testEstimator(48<<30, 0)
+
+	inv, err := e.Inverse(model, 0, "f16", 1)
+	if err != nil {
+		t.Fatalf("Inverse error: %v", err)
+	}
+	if inv.MaxContext == 0 {
+		t.Fatal("expected a non-zero context to fit in 48 GiB")
+	}
+	fwd, err := e.Forward(model, inv.MaxContext, 0, "f16", 1)
+	if err != nil {
+		t.Fatalf("Forward error: %v", err)
+	}
+	if !fwd.Feasible {
+		t.Errorf("Forward at Inverse.MaxContext=%d is not feasible; estimates inconsistent", inv.MaxContext)
+	}
+}
+
+func TestInverse_SWA_Phase2_SmallBudget(t *testing.T) {
+	model := gemma4Model()
+	model.FileSize = 1 << 30 // 1 GiB weights so a small KV budget is reachable
+	// 2 GiB total leaves a KV budget smaller than the fixed SWA window cost, so
+	// phase 1 is skipped and phase 2 (both terms scale with ctx) yields a result
+	// at or below the sliding window size.
+	e := testEstimator(2<<30, 0)
+
+	inv, err := e.Inverse(model, 0, "f16", 1)
+	if err != nil {
+		t.Fatalf("Inverse error: %v", err)
+	}
+	if inv.MaxContext == 0 {
+		t.Fatal("expected a non-zero context to fit")
+	}
+	if inv.MaxContext > model.SlidingWindowSize {
+		t.Errorf("MaxContext = %d, want <= SlidingWindowSize=%d (phase 2 path)", inv.MaxContext, model.SlidingWindowSize)
+	}
+	fwd, err := e.Forward(model, inv.MaxContext, 0, "f16", 1)
+	if err != nil {
+		t.Fatalf("Forward error: %v", err)
+	}
+	if !fwd.Feasible {
+		t.Errorf("Forward at Inverse.MaxContext=%d is not feasible (phase 2)", inv.MaxContext)
+	}
+}
+
+func TestForward_SWA_NonSWARegression(t *testing.T) {
+	// A model with all SWA fields zero must produce exactly the pre-fix all-layers
+	// KV cost. llamaModel() has SlidingWindowSize == 0.
+	model := llamaModel()
+	wantKV := uint64(32) * 8 * 128 * 4096 * 2 * 2 // pre-fix formula, f16
+
+	e := testEstimator(16<<30, 16<<30)
+	r, err := e.Forward(model, 4096, 0, "f16", 1)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if r.KVCost != wantKV {
+		t.Errorf("KVCost = %d, want %d (non-SWA path unchanged)", r.KVCost, wantKV)
 	}
 }
 

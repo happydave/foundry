@@ -25,6 +25,18 @@ type ModelSpec struct {
 	KVHeadCount uint32
 	HeadDim     uint32
 	MaxContext  uint32 // native maximum context length from model metadata
+
+	// Sliding-window (local) attention fields. All zero for models that use
+	// fully global attention, in which case the KV formula reduces to the
+	// all-layers form using LayerCount, KVHeadCount, and HeadDim. When
+	// SlidingWindowSize > 0, the KV cache cost splits into a context-scaling
+	// global term and a fixed sliding-window term.
+	SlidingWindowSize uint32
+	SWAHeadDim        uint32
+	GlobalLayerCount  uint32
+	SWALayerCount     uint32
+	GlobalKVHeadCount uint32
+	SWAKVHeadCount    uint32
 }
 
 // ForwardResult is the output of a forward estimate.
@@ -144,12 +156,23 @@ func (e *Estimator) Inverse(model ModelSpec, inUseBytes uint64, kvType string, n
 	}
 
 	kvBudget := conservativeBudget - weightCost
-	bytesPerCtx := kvCacheBytesPerToken(model, kvBytesPerElement(kvType)) * uint64(nParallel)
-	if bytesPerCtx == 0 {
-		return InverseResult{}, errors.New("KV cache cost per token is zero; cannot compute inverse")
+	bytesPerElem := kvBytesPerElement(kvType)
+
+	var maxCtx uint64
+	if model.SlidingWindowSize > 0 {
+		mc, err := inverseSWAContext(model, kvBudget, bytesPerElem, nParallel)
+		if err != nil {
+			return InverseResult{}, err
+		}
+		maxCtx = mc
+	} else {
+		bytesPerCtx := kvCacheBytesPerToken(model, bytesPerElem) * uint64(nParallel)
+		if bytesPerCtx == 0 {
+			return InverseResult{}, errors.New("KV cache cost per token is zero; cannot compute inverse")
+		}
+		maxCtx = kvBudget / bytesPerCtx
 	}
 
-	maxCtx := kvBudget / bytesPerCtx
 	if maxCtx == 0 {
 		return InverseResult{MaxContext: 0}, nil
 	}
@@ -160,6 +183,44 @@ func (e *Estimator) Inverse(model ModelSpec, inUseBytes uint64, kvType string, n
 	}
 
 	return InverseResult{MaxContext: uint32(maxCtx)}, nil
+}
+
+// inverseSWAContext solves for the largest context size that fits the KV budget
+// for a sliding-window attention model. It proceeds in two phases.
+//
+// Phase 1 assumes the answer exceeds the sliding window size (the common case for
+// large-context models). There, the sliding-window blocks contribute a fixed
+// cost and only the global blocks scale with context: subtract the fixed cost,
+// then divide the remainder by the global per-token cost. If the result exceeds
+// the window size the assumption held and the result is returned.
+//
+// Phase 2 handles the case where the budget is small enough that the answer is
+// at or below the window size. There, both block types scale linearly with
+// context, so divide the budget by the combined per-token cost and cap the
+// result at the window size.
+func inverseSWAContext(model ModelSpec, kvBudget uint64, bytesPerElem float64, nParallel int) (uint64, error) {
+	np := uint64(nParallel)
+
+	// Phase 1: answer assumed greater than the sliding window.
+	swaFixed := swaFixedBytes(model, bytesPerElem) * np
+	perTokenGlobal := kvCacheBytesPerToken(model, bytesPerElem) * np
+	if perTokenGlobal > 0 && swaFixed < kvBudget {
+		maxCtx := (kvBudget - swaFixed) / perTokenGlobal
+		if maxCtx > uint64(model.SlidingWindowSize) {
+			return maxCtx, nil
+		}
+	}
+
+	// Phase 2: answer at or below the sliding window; both terms scale with ctx.
+	combinedPerToken := kvCombinedBytesPerToken(model, bytesPerElem) * np
+	if combinedPerToken == 0 {
+		return 0, errors.New("KV cache cost per token is zero; cannot compute inverse")
+	}
+	maxCtx := kvBudget / combinedPerToken
+	if maxCtx > uint64(model.SlidingWindowSize) {
+		maxCtx = uint64(model.SlidingWindowSize)
+	}
+	return maxCtx, nil
 }
 
 // kvBytesPerElement returns bytes per KV cache element for the given type.
@@ -179,17 +240,67 @@ func kvBytesPerElement(kvType string) float64 {
 }
 
 // kvCacheBytes computes the KV cache cost in bytes for a given context length.
-// Formula: layers × kv_heads × head_dim × ctx_len × bytes_per_element × 2
+//
+// For fully global attention (SlidingWindowSize == 0) the formula is:
+//
+//	layers × kv_heads × head_dim × ctx_len × bytes_per_element × 2
+//
+// For sliding-window attention (SlidingWindowSize > 0) the cost is the sum of a
+// context-scaling global term and a sliding-window term bounded by the window
+// size:
+//
+//	global_layers × global_kv_heads × head_dim × ctx_len × 2
+//	+ swa_layers × swa_kv_heads × swa_head_dim × min(ctx_len, window) × 2
+//
 // The factor of 2 accounts for both key and value caches.
 func kvCacheBytes(model ModelSpec, ctxLen uint32, bytesPerElem float64) uint64 {
-	count := uint64(model.LayerCount) * uint64(model.KVHeadCount) * uint64(model.HeadDim) * uint64(ctxLen) * 2
+	if model.SlidingWindowSize == 0 {
+		count := uint64(model.LayerCount) * uint64(model.KVHeadCount) * uint64(model.HeadDim) * uint64(ctxLen) * 2
+		return uint64(float64(count) * bytesPerElem)
+	}
+	swaCtx := ctxLen
+	if swaCtx > model.SlidingWindowSize {
+		swaCtx = model.SlidingWindowSize
+	}
+	globalElems := uint64(model.GlobalLayerCount) * uint64(model.GlobalKVHeadCount) * uint64(model.HeadDim) * uint64(ctxLen) * 2
+	swaElems := uint64(model.SWALayerCount) * uint64(model.SWAKVHeadCount) * uint64(model.SWAHeadDim) * uint64(swaCtx) * 2
+	return uint64(float64(globalElems+swaElems) * bytesPerElem)
+}
+
+// kvCacheBytesPerToken returns the per-token KV cache cost in bytes — the
+// marginal cost of one additional context token. This is used by Inverse to
+// solve for the maximum context size.
+//
+// For sliding-window models, only the global blocks scale with context length;
+// the sliding-window blocks contribute a constant once ctx_len exceeds the
+// window. Inverse accounts for that constant separately. Thus this function
+// returns only the global scaling term when SlidingWindowSize > 0.
+func kvCacheBytesPerToken(model ModelSpec, bytesPerElem float64) uint64 {
+	if model.SlidingWindowSize == 0 {
+		count := uint64(model.LayerCount) * uint64(model.KVHeadCount) * uint64(model.HeadDim) * 2
+		return uint64(float64(count) * bytesPerElem)
+	}
+	count := uint64(model.GlobalLayerCount) * uint64(model.GlobalKVHeadCount) * uint64(model.HeadDim) * 2
 	return uint64(float64(count) * bytesPerElem)
 }
 
-// kvCacheBytesPerToken returns the KV cache cost in bytes for a single token.
-// This is used by Inverse to solve for the maximum context size.
-func kvCacheBytesPerToken(model ModelSpec, bytesPerElem float64) uint64 {
-	count := uint64(model.LayerCount) * uint64(model.KVHeadCount) * uint64(model.HeadDim) * 2
+// swaFixedBytes returns the fixed (context-independent) KV cache cost of the
+// sliding-window blocks once context length reaches the window size. Zero for
+// non-SWA models.
+func swaFixedBytes(model ModelSpec, bytesPerElem float64) uint64 {
+	if model.SlidingWindowSize == 0 {
+		return 0
+	}
+	elems := uint64(model.SWALayerCount) * uint64(model.SWAKVHeadCount) * uint64(model.SWAHeadDim) * uint64(model.SlidingWindowSize) * 2
+	return uint64(float64(elems) * bytesPerElem)
+}
+
+// kvCombinedBytesPerToken returns the per-token KV cost when both global and
+// sliding-window blocks scale linearly with context — that is, when context
+// length is at or below the window size. Used by Inverse's second phase.
+func kvCombinedBytesPerToken(model ModelSpec, bytesPerElem float64) uint64 {
+	count := (uint64(model.GlobalLayerCount)*uint64(model.GlobalKVHeadCount)*uint64(model.HeadDim) +
+		uint64(model.SWALayerCount)*uint64(model.SWAKVHeadCount)*uint64(model.SWAHeadDim)) * 2
 	return uint64(float64(count) * bytesPerElem)
 }
 
