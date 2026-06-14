@@ -205,6 +205,16 @@ func (r *Registry) parseModel(path string, logger *slog.Logger) (Model, bool, bo
 		return Model{}, false, false
 	}
 
+	// SWA head dimension: the array path (Gemma 4) sets it from key_length_swa;
+	// the period path (Gemma 3) leaves it zero because there is no key_length_swa,
+	// so the SWA blocks share the resolved global head dimension. Resolving it here
+	// guarantees HeadDim and SWAHeadDim never disagree even when headDim came from
+	// the embedding_length / head_count fallback above.
+	swaHeadDim := meta.swaHeadDim
+	if meta.slidingWindowSize > 0 && swaHeadDim == 0 {
+		swaHeadDim = headDim
+	}
+
 	// A sliding-window key was present but the per-layer derivation could not run
 	// (missing pattern, missing per-layer KV head array, or length mismatch). The
 	// model is still usable; estimation falls back to the conservative all-layers
@@ -234,7 +244,7 @@ func (r *Registry) parseModel(path string, logger *slog.Logger) (Model, bool, bo
 		Quantization: fileTypeString(meta.fileType),
 
 		SlidingWindowSize: meta.slidingWindowSize,
-		SWAHeadDim:        meta.swaHeadDim,
+		SWAHeadDim:        swaHeadDim,
 		GlobalLayerCount:  meta.globalLayerCount,
 		SWALayerCount:     meta.swaLayerCount,
 		GlobalKVHeadCount: meta.globalKVHeadCount,

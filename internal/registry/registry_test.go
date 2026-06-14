@@ -1,10 +1,12 @@
 package registry
 
 import (
+	"bytes"
 	"encoding/binary"
 	"log/slog"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 )
 
@@ -364,6 +366,139 @@ func TestRegistry_SWADerivationFallback_MissingPattern(t *testing.T) {
 	}
 	if models[0].SlidingWindowSize != 0 {
 		t.Errorf("SlidingWindowSize = %d, want 0 (derivation should have aborted)", models[0].SlidingWindowSize)
+	}
+}
+
+func TestRegistry_Gemma3SWADerivation(t *testing.T) {
+	// Gemma 3 encodes SWA positionally: no per-layer pattern array, uniform scalar
+	// head_count_kv, and a default interleave period of 6 (global when il%6==5).
+	// For block_count=62 this yields 10 global and 52 SWA layers, with uniform
+	// 16 KV heads and 128 head dim (no key_length_swa).
+	dir := t.TempDir()
+	kvs := []testKV{
+		{key: "general.architecture", vtype: ggufTypeString, val: "gemma3"},
+		{key: "general.file_type", vtype: ggufTypeUint32, val: uint32(14)}, // Q4_K_S
+		{key: "gemma3.block_count", vtype: ggufTypeUint32, val: uint32(62)},
+		{key: "gemma3.attention.head_count", vtype: ggufTypeUint32, val: uint32(32)},
+		{key: "gemma3.attention.head_count_kv", vtype: ggufTypeUint32, val: uint32(16)},
+		{key: "gemma3.attention.key_length", vtype: ggufTypeUint32, val: uint32(128)},
+		{key: "gemma3.attention.sliding_window", vtype: ggufTypeUint32, val: uint32(1024)},
+		// No sliding_window_pattern key: period defaults to 6 for gemma3.
+		{key: "gemma3.context_length", vtype: ggufTypeUint32, val: uint32(131072)},
+	}
+	writeTestGGUF(t, dir, "big-tiger-gemma-27b.gguf", kvs)
+
+	reg := New([]string{dir}, silentLogger())
+	models := reg.List()
+	if len(models) != 1 {
+		t.Fatalf("expected Gemma 3 model to be registered, got %d models", len(models))
+	}
+	m := models[0]
+
+	checks := []struct {
+		name string
+		got  uint32
+		want uint32
+	}{
+		{"SlidingWindowSize", m.SlidingWindowSize, 1024},
+		{"GlobalLayerCount", m.GlobalLayerCount, 10},
+		{"SWALayerCount", m.SWALayerCount, 52},
+		{"GlobalKVHeadCount", m.GlobalKVHeadCount, 16},
+		{"SWAKVHeadCount", m.SWAKVHeadCount, 16},
+		{"HeadDim", m.HeadDim, 128},
+		{"SWAHeadDim", m.SWAHeadDim, 128},
+	}
+	for _, c := range checks {
+		if c.got != c.want {
+			t.Errorf("%s = %d, want %d", c.name, c.got, c.want)
+		}
+	}
+	// GlobalLayerCount + SWALayerCount must equal block_count.
+	if m.GlobalLayerCount+m.SWALayerCount != 62 {
+		t.Errorf("global+SWA = %d, want 62 (block_count)", m.GlobalLayerCount+m.SWALayerCount)
+	}
+}
+
+func TestRegistry_Gemma3_NoDerivationWarning(t *testing.T) {
+	// The Gemma 3 period path must succeed, so the "SWA derivation failed" warning
+	// must not be logged. Capture WARN-level output and assert the message is absent
+	// while the model registers with SWA populated.
+	dir := t.TempDir()
+	kvs := []testKV{
+		{key: "general.architecture", vtype: ggufTypeString, val: "gemma3"},
+		{key: "general.file_type", vtype: ggufTypeUint32, val: uint32(14)},
+		{key: "gemma3.block_count", vtype: ggufTypeUint32, val: uint32(62)},
+		{key: "gemma3.attention.head_count", vtype: ggufTypeUint32, val: uint32(32)},
+		{key: "gemma3.attention.head_count_kv", vtype: ggufTypeUint32, val: uint32(16)},
+		{key: "gemma3.attention.key_length", vtype: ggufTypeUint32, val: uint32(128)},
+		{key: "gemma3.attention.sliding_window", vtype: ggufTypeUint32, val: uint32(1024)},
+		{key: "gemma3.context_length", vtype: ggufTypeUint32, val: uint32(131072)},
+	}
+	writeTestGGUF(t, dir, "gemma3.gguf", kvs)
+
+	var buf bytes.Buffer
+	logger := slog.New(slog.NewTextHandler(&buf, &slog.HandlerOptions{Level: slog.LevelWarn}))
+	models := New([]string{dir}, logger).List()
+
+	if len(models) != 1 || models[0].SlidingWindowSize != 1024 {
+		t.Fatalf("expected Gemma 3 model with SWA populated, got %d models", len(models))
+	}
+	if strings.Contains(buf.String(), "SWA derivation failed") {
+		t.Errorf("unexpected SWA-derivation-failed warning logged:\n%s", buf.String())
+	}
+}
+
+func TestRegistry_PeriodOverrideFromScalarPattern(t *testing.T) {
+	// A scalar sliding_window_pattern overrides the architecture default period.
+	// With period 4 and block_count 12, global layers are il%4==3 → {3,7,11} = 3
+	// global, 9 SWA (vs. the gemma3 default-6 split which would differ).
+	dir := t.TempDir()
+	kvs := []testKV{
+		{key: "general.architecture", vtype: ggufTypeString, val: "gemma3"},
+		{key: "general.file_type", vtype: ggufTypeUint32, val: uint32(14)},
+		{key: "gemma3.block_count", vtype: ggufTypeUint32, val: uint32(12)},
+		{key: "gemma3.attention.head_count", vtype: ggufTypeUint32, val: uint32(32)},
+		{key: "gemma3.attention.head_count_kv", vtype: ggufTypeUint32, val: uint32(16)},
+		{key: "gemma3.attention.key_length", vtype: ggufTypeUint32, val: uint32(128)},
+		{key: "gemma3.attention.sliding_window", vtype: ggufTypeUint32, val: uint32(1024)},
+		{key: "gemma3.attention.sliding_window_pattern", vtype: ggufTypeUint32, val: uint32(4)},
+		{key: "gemma3.context_length", vtype: ggufTypeUint32, val: uint32(131072)},
+	}
+	writeTestGGUF(t, dir, "gemma3-period4.gguf", kvs)
+
+	models := New([]string{dir}, silentLogger()).List()
+	if len(models) != 1 {
+		t.Fatalf("expected 1 model, got %d", len(models))
+	}
+	m := models[0]
+	if m.GlobalLayerCount != 3 || m.SWALayerCount != 9 {
+		t.Errorf("global/SWA = %d/%d, want 3/9 (period 4 override)", m.GlobalLayerCount, m.SWALayerCount)
+	}
+}
+
+func TestRegistry_DegeneratePeriodFallsBack(t *testing.T) {
+	// A scalar period below 2 is degenerate (every layer global) and must be
+	// rejected, leaving the model as a conservative non-SWA fallback.
+	dir := t.TempDir()
+	kvs := []testKV{
+		{key: "general.architecture", vtype: ggufTypeString, val: "gemma3"},
+		{key: "general.file_type", vtype: ggufTypeUint32, val: uint32(14)},
+		{key: "gemma3.block_count", vtype: ggufTypeUint32, val: uint32(62)},
+		{key: "gemma3.attention.head_count", vtype: ggufTypeUint32, val: uint32(32)},
+		{key: "gemma3.attention.head_count_kv", vtype: ggufTypeUint32, val: uint32(16)},
+		{key: "gemma3.attention.key_length", vtype: ggufTypeUint32, val: uint32(128)},
+		{key: "gemma3.attention.sliding_window", vtype: ggufTypeUint32, val: uint32(1024)},
+		{key: "gemma3.attention.sliding_window_pattern", vtype: ggufTypeUint32, val: uint32(1)},
+		{key: "gemma3.context_length", vtype: ggufTypeUint32, val: uint32(131072)},
+	}
+	writeTestGGUF(t, dir, "gemma3-degenerate.gguf", kvs)
+
+	models := New([]string{dir}, silentLogger()).List()
+	if len(models) != 1 {
+		t.Fatalf("expected 1 model, got %d", len(models))
+	}
+	if models[0].SlidingWindowSize != 0 {
+		t.Errorf("SlidingWindowSize = %d, want 0 (degenerate period 1 rejected)", models[0].SlidingWindowSize)
 	}
 }
 

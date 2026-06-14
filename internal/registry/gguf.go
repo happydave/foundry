@@ -182,8 +182,10 @@ type ggufMeta struct {
 	swaKVHeadCount    uint32 // derived: KV head count for SWA blocks
 
 	// Scratch fields used only during derivation; not propagated past parseGGUF.
-	kvHeadCountArray     []uint32 // per-layer head_count_kv when stored as an array
-	slidingWindowPattern []bool   // per-layer flags: true = SWA block, false = global
+	kvHeadCountArray       []uint32 // per-layer head_count_kv when stored as an array
+	slidingWindowPattern   []bool   // per-layer flags: true = SWA block, false = global (Gemma 4)
+	slidingWindowPeriod    uint32   // scalar sliding_window_pattern interpreted as an interleave period (Gemma 3)
+	hasSlidingWindowPeriod bool     // true if sliding_window_pattern was present as a scalar
 
 	hasArchitecture  bool
 	hasLayerCount    bool
@@ -252,11 +254,27 @@ func parseGGUF(path string) (ggufMeta, error) {
 	return meta, nil
 }
 
-// deriveSWA populates the sliding-window attention fields from the per-layer
-// head_count_kv array and the sliding_window_pattern, both gathered during the
-// KV scan. The derivation requires that both arrays are present and their
-// lengths match the block count; otherwise the model is treated as fully global
-// attention (slidingWindowSize cleared to zero) so estimation falls back to the
+// archSWAPeriod maps an architecture to its default sliding-window interleave
+// period for models that encode the pattern positionally rather than as an
+// explicit per-layer array. A period of N means one global (full-attention)
+// block per N blocks. Confirmed against llama.cpp (src/models/gemma3.cpp:
+// swa_period defaults to 6 for Gemma 3). A scalar attention.sliding_window_pattern
+// in the GGUF overrides this default.
+var archSWAPeriod = map[string]uint32{
+	"gemma3": 6,
+}
+
+// deriveSWA populates the sliding-window attention fields. Two encodings are
+// supported:
+//
+//   - Array path (Gemma 4): an explicit per-layer sliding_window_pattern bool
+//     array plus a per-layer head_count_kv array, both length block_count.
+//   - Period path (Gemma 3): a positional interleave where a layer is global
+//     when il % period == period-1. The period comes from a scalar
+//     sliding_window_pattern if present, else an architecture default table.
+//
+// If neither path applies the model is treated as fully global attention
+// (slidingWindowSize cleared to zero) so estimation falls back to the
 // conservative all-layers formula. hasSlidingWindow is left untouched so callers
 // can detect a failed derivation (key present but fields not derived).
 func (meta *ggufMeta) deriveSWA() {
@@ -264,10 +282,32 @@ func (meta *ggufMeta) deriveSWA() {
 		return
 	}
 	n := int(meta.layerCount)
-	if n == 0 || len(meta.slidingWindowPattern) != n || len(meta.kvHeadCountArray) != n {
+	if n == 0 {
 		meta.slidingWindowSize = 0
 		return
 	}
+
+	// Array path (Gemma 4): explicit per-layer pattern + per-layer KV head counts.
+	if len(meta.slidingWindowPattern) == n && len(meta.kvHeadCountArray) == n {
+		meta.deriveSWAFromArrays(n)
+		return
+	}
+
+	// Period path (Gemma 3): positional interleave with uniform KV heads.
+	if period, ok := meta.swaPeriod(); ok && meta.hasKVHeadCount && meta.kvHeadCount > 0 {
+		meta.deriveSWAFromPeriod(n, period)
+		return
+	}
+
+	// Neither path applies: conservative fallback.
+	meta.slidingWindowSize = 0
+}
+
+// deriveSWAFromArrays computes the global/SWA split from the per-layer pattern
+// and per-layer KV head arrays (Gemma 4). For each block type the maximum KV
+// head count across its layers is used (conservative; equals the value when
+// uniform).
+func (meta *ggufMeta) deriveSWAFromArrays(n int) {
 	var globalCount, swaCount, globalHeads, swaHeads uint32
 	for i := 0; i < n; i++ {
 		h := meta.kvHeadCountArray[i]
@@ -287,6 +327,49 @@ func (meta *ggufMeta) deriveSWA() {
 	meta.swaLayerCount = swaCount
 	meta.globalKVHeadCount = globalHeads
 	meta.swaKVHeadCount = swaHeads
+}
+
+// deriveSWAFromPeriod computes the global/SWA split positionally: a layer is
+// global (full attention) when il % period == period-1, SWA otherwise. KV head
+// counts are uniform (the scalar head_count_kv) for both block types. swaHeadDim
+// is left for parseModel to resolve from the global head dimension, since Gemma 3
+// has no key_length_swa.
+func (meta *ggufMeta) deriveSWAFromPeriod(n int, period uint32) {
+	var globalCount, swaCount uint32
+	for il := uint32(0); il < uint32(n); il++ {
+		if il%period == period-1 {
+			globalCount++
+		} else {
+			swaCount++
+		}
+	}
+	meta.globalLayerCount = globalCount
+	meta.swaLayerCount = swaCount
+	meta.globalKVHeadCount = meta.kvHeadCount
+	meta.swaKVHeadCount = meta.kvHeadCount
+}
+
+// swaPeriod returns the interleave period for the period-based derivation path.
+// A scalar sliding_window_pattern in the GGUF takes precedence over the
+// architecture default table. A period below 2 is degenerate (every layer would
+// be global) and is rejected so the model falls back to the conservative
+// all-layers estimate.
+func (meta *ggufMeta) swaPeriod() (uint32, bool) {
+	var period uint32
+	switch {
+	case meta.hasSlidingWindowPeriod:
+		period = meta.slidingWindowPeriod
+	default:
+		p, ok := archSWAPeriod[meta.architecture]
+		if !ok {
+			return 0, false
+		}
+		period = p
+	}
+	if period < 2 {
+		return 0, false
+	}
+	return period, true
 }
 
 // applyMeta extracts known fields from a single KV pair and stores them in meta.
@@ -352,8 +435,13 @@ func applyMeta(meta *ggufMeta, key string, val any) {
 				meta.hasSlidingWindow = true
 			}
 		case "attention.sliding_window_pattern":
+			// Architecture-overloaded key. Gemma 4 stores a per-layer bool array;
+			// Gemma 3 (and other period-based arches) store a scalar interleave period.
 			if arr, ok := val.([]any); ok {
 				meta.slidingWindowPattern = boolSliceFromArray(arr)
+			} else if v, ok := toUint32(val); ok {
+				meta.slidingWindowPeriod = v
+				meta.hasSlidingWindowPeriod = true
 			}
 		case "embedding_length":
 			if v, ok := toUint32(val); ok {

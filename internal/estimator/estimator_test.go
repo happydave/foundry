@@ -55,6 +55,26 @@ func gemma4Model() ModelSpec {
 	}
 }
 
+// gemma3Model returns a ModelSpec for the Gemma 3 27B model with sliding-window
+// attention derived positionally (period 6). Unlike Gemma 4, KV heads and head
+// dim are uniform across global and SWA blocks: 62 blocks split into 10 global
+// and 52 SWA, all with 16 KV heads and 128 head dim, window 1024, native 131072.
+func gemma3Model() ModelSpec {
+	return ModelSpec{
+		FileSize:          16 << 30, // ~16 GiB representative weight size (27B Q4_K_S)
+		LayerCount:        62,
+		KVHeadCount:       16,
+		HeadDim:           128,
+		MaxContext:        131072,
+		SlidingWindowSize: 1024,
+		SWAHeadDim:        128,
+		GlobalLayerCount:  10,
+		SWALayerCount:     52,
+		GlobalKVHeadCount: 16,
+		SWAKVHeadCount:    16,
+	}
+}
+
 // --- Forward tests ---
 
 func TestForward_Formula(t *testing.T) {
@@ -596,6 +616,50 @@ func TestForward_SWA_NonSWARegression(t *testing.T) {
 	}
 	if r.KVCost != wantKV {
 		t.Errorf("KVCost = %d, want %d (non-SWA path unchanged)", r.KVCost, wantKV)
+	}
+}
+
+func TestForward_SWA_Gemma3_Uniform(t *testing.T) {
+	model := gemma3Model()
+	// At native max 131072 (> window), uniform heads/dims:
+	//   global: 10 × 16 × 128 × 131072 × 2 elems
+	//   swa:    52 × 16 × 128 × 1024   × 2 elems  (min(ctx, 1024) = 1024)
+	// f16 = 2 bytes/elem.
+	wantKV := uint64(10*16*128*131072*2+52*16*128*1024*2) * 2
+
+	e := testEstimator(256<<30, 256<<30)
+	r, err := e.Forward(model, 131072, 0, "f16", 1)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if r.KVCost != wantKV {
+		t.Errorf("KVCost = %d, want %d (uniform global scaling + fixed SWA window)", r.KVCost, wantKV)
+	}
+	if !r.Feasible {
+		t.Error("expected Feasible=true with ample memory")
+	}
+}
+
+func TestInverse_SWA_Gemma3_BeatsAllLayers(t *testing.T) {
+	model := gemma3Model()
+	// 48 GiB budget: the corrected SWA formula (~11 GiB KV at full context) reaches
+	// the native max 131072, whereas the pre-fix all-layers formula
+	// (62 × 16 × 128 × ctx) would cap near ~50K. Assert the native max is reached.
+	e := testEstimator(48<<30, 0)
+	r, err := e.Inverse(model, 0, "f16", 1)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if r.MaxContext != 131072 {
+		t.Errorf("MaxContext = %d, want 131072 (native max; all-layers formula would cap far lower)", r.MaxContext)
+	}
+	// Consistency: Forward at the reported max must be feasible.
+	fwd, err := e.Forward(model, r.MaxContext, 0, "f16", 1)
+	if err != nil {
+		t.Fatalf("Forward error: %v", err)
+	}
+	if !fwd.Feasible {
+		t.Errorf("Forward at Inverse.MaxContext=%d is not feasible", r.MaxContext)
 	}
 }
 
