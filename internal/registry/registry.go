@@ -249,6 +249,7 @@ func (r *Registry) parseModel(path string, logger *slog.Logger) (Model, bool, bo
 // and sizes in different scan directories receive distinct IDs and are treated as separate models.
 func fingerprint(absPath string, fileSize int64) uint64 {
 	h := fnv.New64a()
-	fmt.Fprintf(h, "%s\x00%d", absPath, fileSize)
+	// fnv hash writers never return an error; discard the result explicitly.
+	_, _ = fmt.Fprintf(h, "%s\x00%d", absPath, fileSize)
 	return h.Sum64()
 }
