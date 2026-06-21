@@ -50,8 +50,8 @@ func runHelper(mode string) {
 		mux.HandleFunc("/health", func(w http.ResponseWriter, _ *http.Request) {
 			w.WriteHeader(http.StatusOK)
 		})
-		fmt.Fprintln(os.Stdout, "fake-server: ready")
-		fmt.Fprintln(os.Stderr, "fake-server: stderr line")
+		_, _ = fmt.Fprintln(os.Stdout, "fake-server: ready")
+		_, _ = fmt.Fprintln(os.Stderr, "fake-server: stderr line")
 		srv := &http.Server{Addr: "127.0.0.1:" + port, Handler: mux}
 		stop := make(chan os.Signal, 1)
 		signal.Notify(stop, syscall.SIGTERM)
@@ -77,7 +77,7 @@ func runHelper(mode string) {
 			w.WriteHeader(http.StatusOK)
 		})
 		srv := &http.Server{Addr: "127.0.0.1:" + port, Handler: mux}
-		fmt.Fprintln(os.Stdout, "fake-server: ready (hang mode)")
+		_, _ = fmt.Fprintln(os.Stdout, "fake-server: ready (hang mode)")
 		if err := srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
 			os.Exit(1)
 		}
@@ -524,11 +524,7 @@ func newVersionCheckCmd(t *testing.T) func(string, ...string) *exec.Cmd {
 func TestCheckBinaryVersion_KnownVersion(t *testing.T) {
 	// The print-version helper emits "version: 9536 (308f61c31)" — verify match.
 	err := checkBinaryVersionWithCmd(os.Args[0], []string{"version: 9536 (308f61c31)"},
-		func(binary string, arg ...string) *exec.Cmd {
-			cmd := exec.Command(os.Args[0])
-			cmd.Env = append(os.Environ(), helperEnvKey+"=print-version")
-			return cmd
-		})
+		newVersionCheckCmd(t))
 	if err != nil {
 		t.Errorf("expected nil for matching version, got: %v", err)
 	}
@@ -536,11 +532,7 @@ func TestCheckBinaryVersion_KnownVersion(t *testing.T) {
 
 func TestCheckBinaryVersion_UnknownVersion(t *testing.T) {
 	err := checkBinaryVersionWithCmd(os.Args[0], []string{"version: 9999 (unknown)"},
-		func(_ string, _ ...string) *exec.Cmd {
-			cmd := exec.Command(os.Args[0])
-			cmd.Env = append(os.Environ(), helperEnvKey+"=print-version")
-			return cmd
-		})
+		newVersionCheckCmd(t))
 	if err == nil {
 		t.Error("expected error for non-matching version, got nil")
 	}
