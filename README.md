@@ -2,7 +2,7 @@
 
 A local LLM inference service designed to run as a system daemon. Foundry manages one or more `llama-server` subprocesses — one per loaded model — and presents a unified inference API over them, supporting both the OpenAI and Anthropic wire formats.
 
-Foundry is for users who need reliable, scriptable model serving integrated into automation pipelines. It is not a GUI tool.
+Foundry is for users who need reliable, scriptable model serving integrated into automation pipelines. Its primary surface is the API; an optional, embedded operator console (see [Management UI](#management-ui)) is available for inspecting hardware and loaded models and for loading/unloading models by hand. Foundry is not a chat interface — interactive chat with models is the concern of the separate webChat project.
 
 ## How it works
 
@@ -57,6 +57,10 @@ listen_address: 0.0.0.0:8080
 
 # Log level: debug, info, warn, error (default: info)
 log_level: info
+
+# Enable the embedded operator console at /ui/ (optional; default: false).
+# When false, /ui/ is not served. See the Management UI section below.
+enable_ui: false
 
 # Extra flags appended verbatim to every llama-server subprocess invocation (optional)
 # Useful for backend selectors and site-specific flags not otherwise exposed by Foundry.
@@ -215,6 +219,27 @@ GET /api/v1/status
 ```
 
 Returns service health, currently loaded models, and a summary of VRAM usage.
+Each loaded-model entry includes `model_id` and `port` plus `display_name`,
+`context_size`, `health`, and `estimated_vram_bytes` — the latter is the
+estimator's predicted footprint for that model at its loaded context size (an
+estimate, not a measurement).
+
+### Hardware
+
+```
+GET /api/v1/hardware
+```
+
+Returns per-GPU hardware detail and system memory availability. Each entry in
+`gpus` contains `index` (the DRM card number), `identity` (the driver-provided
+product name when available, otherwise the PCI `vendor:device` pair), and
+`vram_total_bytes` / `vram_used_bytes` / `vram_available_bytes`. The top-level
+`system_ram_available_bytes` reports available system RAM. All figures are live
+reads. Returns 500 if no AMD DRM sysfs entries are found.
+
+```sh
+curl http://localhost:8080/api/v1/hardware
+```
 
 ### Model discovery
 
@@ -223,7 +248,7 @@ GET /api/v1/models
 GET /api/v1/models/{id}
 ```
 
-`GET /api/v1/models` returns all models found at startup in LM Studio-compatible format (`{ "models": [...] }`). Each entry contains `key` (equals `display_name`), `type`, `architecture`, `size_bytes`, `context_length`, `quantization` (object with `name` and `bits_per_weight`), and `loaded_instances` (non-null array, non-empty when the model is running). This endpoint is compatible with LM Studio clients such as lmstudio-for-copilot.
+`GET /api/v1/models` returns all models found at startup in LM Studio-compatible format (`{ "models": [...] }`). Each entry contains `key` (equals `display_name`), `id` (the decimal model fingerprint as a string, for use in management calls), `type`, `architecture`, `size_bytes`, `context_length`, `quantization` (object with `name` and `bits_per_weight`), and `loaded_instances` (non-null array, non-empty when the model is running). This endpoint is compatible with LM Studio clients such as lmstudio-for-copilot. The `id` is a string because the fingerprint is a 64-bit value that would lose precision as a JSON number in some clients (e.g. browsers).
 
 `GET /api/v1/models/{id}` takes a numeric model ID and returns detailed metadata plus a resource estimate at native max context and the estimated maximum loadable context given current VRAM availability.
 
@@ -245,6 +270,33 @@ GET /api/v1/models/{id}/estimate?ctx={n}
 ```
 
 Returns the estimated memory cost for a given model at a given context size and whether it fits in currently available VRAM. Does not load the model.
+
+## Management UI
+
+Foundry ships an optional, embedded operator console — a static, zero-dependency
+web page served by the daemon itself. It is **disabled by default**; enable it by
+setting `enable_ui: true` in the config. When enabled, browse to:
+
+```
+http://<host>:<port>/ui/
+```
+
+The console has three panels:
+
+- **Hardware** — each GPU's identity and VRAM used/total (with percentage), plus
+  available system RAM. These are measured figures from `GET /api/v1/hardware`.
+- **Loaded models** — display name, context size, health, and estimated VRAM for
+  each loaded model, from `GET /api/v1/status`. VRAM here is an *estimate* and is
+  labelled as such.
+- **Models** — every discovered model with size and loaded state, with Load and
+  Unload controls. Loading consults the resource estimate first and warns if the
+  model will not fit or must use a reduced context.
+
+The console is served same-origin and calls the existing management API; no extra
+ports or build tooling are involved. It currently has **no authentication** — like
+the rest of Foundry it assumes a trusted, network-local deployment. If that does
+not hold for your network, bind Foundry to loopback or front it with an
+authenticating proxy.
 
 ## Example workflow
 
@@ -282,3 +334,5 @@ go vet ./...
 | OpenAI-compatible inference proxy | Implemented |
 | Anthropic-compatible inference proxy (`/v1/messages`) | Implemented |
 | Session history store (JSONL backend) | Implemented |
+| Hardware API (`/api/v1/hardware`) | Implemented |
+| Management UI (operator console at `/ui/`) | Implemented |

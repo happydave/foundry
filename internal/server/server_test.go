@@ -129,6 +129,11 @@ func newFixture(t *testing.T) *serverFixture {
 	s := newServer("127.0.0.1:0", reg, pm, est, 35, "q8_0", 1, nil, nil)
 	s.queryResources = func() (uint64, uint64, error) { return 8 << 30, 8 << 30, nil }
 	s.queryVRAMTotal = func() (uint64, error) { return 16 << 30, nil }
+	s.queryHardware = func() ([]estimator.GPUInfo, uint64, error) {
+		return []estimator.GPUInfo{
+			{Index: 0, Identity: "1002:164e", VRAMTotal: 16 << 30, VRAMUsed: 8 << 30, VRAMAvail: 8 << 30},
+		}, 32 << 30, nil
+	}
 
 	ln, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
@@ -700,7 +705,10 @@ func TestStatus_NoModels(t *testing.T) {
 
 func TestStatus_WithLoadedModel(t *testing.T) {
 	f := newFixture(t)
-	f.pm.loaded[5] = &processmanager.LoadedModel{ModelID: 5, Port: 9100}
+	m := testModel(5)
+	m.DisplayName = "loaded-model"
+	f.reg.models = []registry.Model{m}
+	f.pm.loaded[5] = &processmanager.LoadedModel{ModelID: 5, Port: 9100, ContextSize: 8192}
 
 	resp := f.do(t, http.MethodGet, "/api/v1/status", nil)
 	assertStatus(t, resp, http.StatusOK)
@@ -709,8 +717,48 @@ func TestStatus_WithLoadedModel(t *testing.T) {
 	if len(sr.LoadedModels) != 1 {
 		t.Fatalf("expected 1 loaded model, got %d", len(sr.LoadedModels))
 	}
-	if sr.LoadedModels[0].ModelID != 5 || sr.LoadedModels[0].Port != 9100 {
-		t.Errorf("unexpected loaded model entry: %+v", sr.LoadedModels[0])
+	got := sr.LoadedModels[0]
+	// Backward-compatible fields.
+	if got.ModelID != 5 || got.Port != 9100 {
+		t.Errorf("unexpected base loaded model entry: %+v", got)
+	}
+	// Enriched fields.
+	if got.DisplayName != "loaded-model" {
+		t.Errorf("expected display_name loaded-model, got %q", got.DisplayName)
+	}
+	if got.ContextSize != 8192 {
+		t.Errorf("expected context_size 8192, got %d", got.ContextSize)
+	}
+	if got.Health == "" {
+		t.Error("expected non-empty health")
+	}
+	if got.EstimatedVRAMBytes == 0 {
+		t.Error("expected non-zero estimated VRAM for a registry-known model")
+	}
+}
+
+func TestStatus_LoadedModelMissingFromRegistry(t *testing.T) {
+	f := newFixture(t)
+	// Loaded model not present in the (empty) registry: status must still 200
+	// with the entry present and enrichment defaulted.
+	f.pm.loaded[7] = &processmanager.LoadedModel{ModelID: 7, Port: 9200, ContextSize: 4096}
+
+	resp := f.do(t, http.MethodGet, "/api/v1/status", nil)
+	assertStatus(t, resp, http.StatusOK)
+	sr := decodeBody[statusResponse](t, resp)
+
+	if len(sr.LoadedModels) != 1 {
+		t.Fatalf("expected 1 loaded model, got %d", len(sr.LoadedModels))
+	}
+	got := sr.LoadedModels[0]
+	if got.ModelID != 7 || got.Port != 9200 {
+		t.Errorf("unexpected entry: %+v", got)
+	}
+	if got.DisplayName != "" || got.EstimatedVRAMBytes != 0 {
+		t.Errorf("expected defaulted enrichment for unknown model, got %+v", got)
+	}
+	if got.ContextSize != 4096 {
+		t.Errorf("expected context_size 4096 from loaded record, got %d", got.ContextSize)
 	}
 }
 
@@ -1130,5 +1178,106 @@ func TestServer_GracefulShutdown(t *testing.T) {
 	}
 	if err := <-shutdownDone; err != nil {
 		t.Fatalf("shutdown returned error: %v", err)
+	}
+}
+
+// --- GET /api/v1/hardware ---
+
+func TestHardware_Success(t *testing.T) {
+	f := newFixture(t)
+	f.srv.queryHardware = func() ([]estimator.GPUInfo, uint64, error) {
+		return []estimator.GPUInfo{
+			{Index: 0, Identity: "1002:164e", VRAMTotal: 16 << 30, VRAMUsed: 4 << 30, VRAMAvail: 12 << 30},
+			{Index: 1, Identity: "Radeon RX 7900", VRAMTotal: 24 << 30, VRAMUsed: 24 << 30, VRAMAvail: 0},
+		}, 64 << 30, nil
+	}
+
+	resp := f.do(t, http.MethodGet, "/api/v1/hardware", nil)
+	assertStatus(t, resp, http.StatusOK)
+	hw := decodeBody[hardwareResponse](t, resp)
+
+	if hw.GPUs == nil {
+		t.Fatal("expected gpus array, got null")
+	}
+	if len(hw.GPUs) != 2 {
+		t.Fatalf("expected 2 GPUs, got %d", len(hw.GPUs))
+	}
+	if hw.GPUs[0].Identity != "1002:164e" || hw.GPUs[0].VRAMAvailableBytes != 12<<30 {
+		t.Fatalf("unexpected first GPU: %+v", hw.GPUs[0])
+	}
+	if hw.GPUs[1].Identity == "" {
+		t.Fatal("expected non-empty identity for second GPU")
+	}
+	if hw.SystemRAMAvailableBytes != 64<<30 {
+		t.Fatalf("unexpected system RAM: %d", hw.SystemRAMAvailableBytes)
+	}
+}
+
+func TestHardware_QueryError(t *testing.T) {
+	f := newFixture(t)
+	f.srv.queryHardware = func() ([]estimator.GPUInfo, uint64, error) {
+		return nil, 0, fmt.Errorf("no AMD DRM VRAM sysfs entries found")
+	}
+
+	resp := f.do(t, http.MethodGet, "/api/v1/hardware", nil)
+	if resp.StatusCode == http.StatusOK {
+		t.Fatalf("expected non-200 on query error, got 200")
+	}
+}
+
+// --- /ui/ operator console ---
+
+func TestUI_DisabledReturns404(t *testing.T) {
+	f := newFixture(t) // uiEnabled defaults to false
+	resp := f.do(t, http.MethodGet, "/ui/", nil)
+	defer func() { _ = resp.Body.Close() }()
+	if resp.StatusCode != http.StatusNotFound {
+		t.Fatalf("expected 404 when UI disabled, got %d", resp.StatusCode)
+	}
+}
+
+func TestUI_EnabledServesIndex(t *testing.T) {
+	f := newFixture(t)
+	f.srv.SetUIEnabled(true)
+
+	resp := f.do(t, http.MethodGet, "/ui/", nil)
+	defer func() { _ = resp.Body.Close() }()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("expected 200 when UI enabled, got %d", resp.StatusCode)
+	}
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(body), "Foundry") {
+		t.Fatalf("expected index HTML to mention Foundry, got %q", string(body[:min(80, len(body))]))
+	}
+}
+
+func TestUI_EnabledServesAsset(t *testing.T) {
+	f := newFixture(t)
+	f.srv.SetUIEnabled(true)
+
+	resp := f.do(t, http.MethodGet, "/ui/app.js", nil)
+	defer func() { _ = resp.Body.Close() }()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("expected 200 for /ui/app.js when enabled, got %d", resp.StatusCode)
+	}
+}
+
+func TestListModels_ExposesStringID(t *testing.T) {
+	f := newFixture(t)
+	m := testModel(0xDEADBEEFCAFEF00D) // > 2^53; must round-trip as a string
+	f.reg.models = []registry.Model{m}
+
+	resp := f.do(t, http.MethodGet, "/api/v1/models", nil)
+	assertStatus(t, resp, http.StatusOK)
+	mr := decodeBody[lmsModelsResponse](t, resp)
+	if len(mr.Models) != 1 {
+		t.Fatalf("expected 1 model, got %d", len(mr.Models))
+	}
+	want := "16045690984503111693" // strconv of the fingerprint above
+	if mr.Models[0].ID != want {
+		t.Fatalf("expected string id %q, got %q", want, mr.Models[0].ID)
 	}
 }

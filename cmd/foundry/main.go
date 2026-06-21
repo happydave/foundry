@@ -74,6 +74,10 @@ func main() {
 	}
 
 	srv := server.New(cfg.ListenAddress, reg, pm, est, cfg.DefaultGPULayers, cfg.KVCacheType, cfg.Parallel, resolvedOpts, logger)
+	srv.SetUIEnabled(cfg.EnableUI)
+	if cfg.EnableUI {
+		logger.Info("operator console enabled", "path", "/ui/")
+	}
 
 	if fi, err := os.Stat(cfg.HistorySessionsDir); err != nil || !fi.IsDir() {
 		logger.Warn("history_sessions_dir does not exist or is not a directory; persistent session history is disabled",

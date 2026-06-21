@@ -1,0 +1,43 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Foundry — Operator Console</title>
+  <link rel="stylesheet" href="style.css">
+</head>
+<body>
+  <header>
+    <h1>Foundry</h1>
+    <span class="sub">operator console</span>
+    <span id="conn" class="pill"></span>
+  </header>
+
+  <main>
+    <section class="panel" id="hardware-panel">
+      <h2>Hardware</h2>
+      <div class="panel-body" id="hardware-body">
+        <p class="muted">Loading…</p>
+      </div>
+    </section>
+
+    <section class="panel" id="loaded-panel">
+      <h2>Loaded models <span class="tag est">VRAM = estimate</span></h2>
+      <div class="panel-body" id="loaded-body">
+        <p class="muted">Loading…</p>
+      </div>
+    </section>
+
+    <section class="panel" id="models-panel">
+      <h2>Models</h2>
+      <div class="panel-body" id="models-body">
+        <p class="muted">Loading…</p>
+      </div>
+    </section>
+  </main>
+
+  <div id="toast" class="toast hidden"></div>
+
+  <script src="app.js"></script>
+</body>
+</html>

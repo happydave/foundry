@@ -7,7 +7,11 @@ type lmsModelsResponse struct {
 }
 
 type lmsModelEntry struct {
-	Key             string              `json:"key"`
+	Key string `json:"key"`
+	// ID is the decimal model fingerprint as a string. It is exposed for clients
+	// (notably the browser UI) that need an exact identifier for management calls;
+	// the fingerprint is a 64-bit value that would lose precision as a JSON number.
+	ID              string              `json:"id"`
 	Type            string              `json:"type"`
 	Publisher       string              `json:"publisher"`
 	DisplayName     string              `json:"display_name"`

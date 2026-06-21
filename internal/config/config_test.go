@@ -453,3 +453,36 @@ models:
 		t.Errorf("error %q does not mention parallel", got)
 	}
 }
+
+func TestLoad_EnableUI(t *testing.T) {
+	// Default: absent -> false.
+	def := writeTemp(t, `
+model_scan_paths: [/models]
+llama_server_binary: /usr/bin/llama-server
+default_gpu_layers: 32
+history_sessions_dir: /var/foundry/sessions
+`)
+	cfg, err := Load(def)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if cfg.EnableUI {
+		t.Error("expected EnableUI to default to false")
+	}
+
+	// Explicit true.
+	on := writeTemp(t, `
+model_scan_paths: [/models]
+llama_server_binary: /usr/bin/llama-server
+default_gpu_layers: 32
+history_sessions_dir: /var/foundry/sessions
+enable_ui: true
+`)
+	cfg2, err := Load(on)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if !cfg2.EnableUI {
+		t.Error("expected EnableUI true")
+	}
+}

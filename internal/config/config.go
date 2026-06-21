@@ -41,6 +41,7 @@ type Config struct {
 	HistorySessionsDir   string                 `yaml:"history_sessions_dir"`
 	ListenAddress        string                 `yaml:"listen_address"`
 	LogLevel             string                 `yaml:"log_level"`
+	EnableUI             bool                   `yaml:"enable_ui"`
 	Models               map[string]ModelConfig `yaml:"models"`
 }
 

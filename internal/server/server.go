@@ -60,9 +60,13 @@ type Server struct {
 	// historyStore, if set, enables persistent session history for chat completions.
 	historyStore history.Store
 
+	// uiEnabled gates serving of the embedded operator console under /ui/.
+	uiEnabled bool
+
 	// Injectable for testing; default to the real sysfs implementations.
 	queryResources func() (vramAvail, ramAvail uint64, err error)
 	queryVRAMTotal func() (uint64, error)
+	queryHardware  func() (gpus []estimator.GPUInfo, ramAvail uint64, err error)
 }
 
 func New(addr string, reg *registry.Registry, pm *processmanager.Manager, est *estimator.Estimator, defaultGPULayers int, globalKVCacheType string, globalParallel int, resolvedModelOpts map[string]processmanager.ModelLoadOptions, logger *slog.Logger) *Server {
@@ -96,6 +100,7 @@ func newServer(addr string, reg modelRegistry, pm processManager, est resourceEs
 		logger:            logger,
 		queryResources:    estimator.QueryResources,
 		queryVRAMTotal:    estimator.QueryVRAMTotal,
+		queryHardware:     estimator.QueryHardware,
 	}
 
 	mux := http.NewServeMux()
@@ -105,11 +110,13 @@ func newServer(addr string, reg modelRegistry, pm processManager, est resourceEs
 	mux.HandleFunc("POST /v1/messages", s.handleMessagesProxy)
 	mux.HandleFunc("/v1/", notImplemented)
 	mux.HandleFunc("GET /api/v1/status", s.handleStatus)
+	mux.HandleFunc("GET /api/v1/hardware", s.handleHardware)
 	mux.HandleFunc("GET /api/v1/models", s.handleListModels)
 	mux.HandleFunc("GET /api/v1/models/{id}", s.handleGetModel)
 	mux.HandleFunc("POST /api/v1/models/{id}/load", s.handleLoadModel)
 	mux.HandleFunc("DELETE /api/v1/models/{id}", s.handleUnloadModel)
 	mux.HandleFunc("GET /api/v1/models/{id}/estimate", s.handleEstimate)
+	s.registerUI(mux)
 
 	s.http = &http.Server{
 		Addr:    addr,
@@ -193,8 +200,12 @@ type loadRequest struct {
 }
 
 type loadedModelInfo struct {
-	ModelID uint64 `json:"model_id"`
-	Port    int    `json:"port"`
+	ModelID            uint64 `json:"model_id"`
+	Port               int    `json:"port"`
+	DisplayName        string `json:"display_name"`
+	ContextSize        int    `json:"context_size"`
+	Health             string `json:"health"`
+	EstimatedVRAMBytes uint64 `json:"estimated_vram_bytes"`
 }
 
 type memoryInfo struct {
@@ -207,6 +218,19 @@ type statusResponse struct {
 	Status       string            `json:"status"`
 	LoadedModels []loadedModelInfo `json:"loaded_models"`
 	Memory       memoryInfo        `json:"memory"`
+}
+
+type gpuInfoResponse struct {
+	Index              int    `json:"index"`
+	Identity           string `json:"identity"`
+	VRAMTotalBytes     uint64 `json:"vram_total_bytes"`
+	VRAMUsedBytes      uint64 `json:"vram_used_bytes"`
+	VRAMAvailableBytes uint64 `json:"vram_available_bytes"`
+}
+
+type hardwareResponse struct {
+	GPUs                    []gpuInfoResponse `json:"gpus"`
+	SystemRAMAvailableBytes uint64            `json:"system_ram_available_bytes"`
 }
 
 // --- helpers ---
@@ -287,6 +311,7 @@ func (s *Server) handleListModels(w http.ResponseWriter, r *http.Request) {
 		}
 		entries[i] = lmsModelEntry{
 			Key:           m.DisplayName,
+			ID:            strconv.FormatUint(m.ID, 10),
 			Type:          "llm",
 			Publisher:     "",
 			DisplayName:   m.DisplayName,
@@ -484,12 +509,53 @@ func (s *Server) handleEstimate(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
+func (s *Server) handleHardware(w http.ResponseWriter, r *http.Request) {
+	gpus, ramAvail, err := s.queryHardware()
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, fmt.Sprintf("hardware query failed: %v", err))
+		return
+	}
+
+	entries := make([]gpuInfoResponse, 0, len(gpus))
+	for _, g := range gpus {
+		entries = append(entries, gpuInfoResponse{
+			Index:              g.Index,
+			Identity:           g.Identity,
+			VRAMTotalBytes:     g.VRAMTotal,
+			VRAMUsedBytes:      g.VRAMUsed,
+			VRAMAvailableBytes: g.VRAMAvail,
+		})
+	}
+
+	writeJSON(w, http.StatusOK, hardwareResponse{
+		GPUs:                    entries,
+		SystemRAMAvailableBytes: ramAvail,
+	})
+}
+
 func (s *Server) handleStatus(w http.ResponseWriter, r *http.Request) {
 	loaded := s.procMgr.List()
 
 	infos := make([]loadedModelInfo, len(loaded))
 	for i, lm := range loaded {
-		infos[i] = loadedModelInfo{ModelID: lm.ModelID, Port: lm.Port}
+		info := loadedModelInfo{
+			ModelID:     lm.ModelID,
+			Port:        lm.Port,
+			ContextSize: lm.ContextSize,
+			Health:      healthString(lm),
+		}
+		// Enrich with display name and an estimated VRAM cost when the model is
+		// still in the registry. Estimation is best-effort: a lookup miss or
+		// estimator error leaves the defaults (empty name, zero estimate) rather
+		// than failing the status response.
+		if m, found := s.registry.Get(lm.ModelID); found {
+			info.DisplayName = m.DisplayName
+			opts := s.resolveOpts(m.DisplayName)
+			if fwd, err := s.estimator.Forward(modelSpec(m), uint32(lm.ContextSize), 0, opts.KVCacheType, opts.Parallel); err == nil {
+				info.EstimatedVRAMBytes = fwd.TotalCost
+			}
+		}
+		infos[i] = info
 	}
 
 	vramTotal, _ := s.queryVRAMTotal()
