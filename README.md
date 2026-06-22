@@ -92,9 +92,9 @@ official template file:
 ```yaml
 models:
   gemma-4-31B-it:
-    chat_template_file: /home/dave/Documents/jinja/gemma-4-31B-it/chat_template.jinja
+    chat_template_file: /home/user/Documents/jinja/gemma-4-31B-it/chat_template.jinja
   gemma-4-26B-A4B-it:
-    chat_template_file: /home/dave/Documents/jinja/gemma-4-26B-A4B-it/chat_template.jinja
+    chat_template_file: /home/user/Documents/jinja/gemma-4-26B-A4B-it/chat_template.jinja
 ```
 
 Template args are passed to llama-server after the standard model flags
