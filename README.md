@@ -220,9 +220,11 @@ GET /api/v1/status
 
 Returns service health, currently loaded models, and a summary of VRAM usage.
 Each loaded-model entry includes `model_id` and `port` plus `display_name`,
-`context_size`, `health`, and `estimated_vram_bytes` — the latter is the
-estimator's predicted footprint for that model at its loaded context size (an
-estimate, not a measurement).
+`context_size`, `health`, `estimated_vram_bytes`, and `measured_vram_bytes`.
+`estimated_vram_bytes` is the estimator's predicted footprint for that model at
+its loaded context size (an estimate, not a measurement); `measured_vram_bytes`
+is the model subprocess's actual resident VRAM read from its `fdinfo`, summed
+across cards (zero when the measurement is unavailable).
 
 ### Hardware
 
@@ -236,6 +238,26 @@ product name when available, otherwise the PCI `vendor:device` pair), and
 `vram_total_bytes` / `vram_used_bytes` / `vram_available_bytes`. The top-level
 `system_ram_available_bytes` reports available system RAM. All figures are live
 reads. Returns 500 if no AMD DRM sysfs entries are found.
+
+Each `gpus` entry additionally carries a breakdown of what is using the card:
+
+- `pools` — the other AMD memory pools beyond dedicated VRAM:
+  `gtt_total_bytes` / `gtt_used_bytes` (the GTT pool of system RAM the GPU maps —
+  significant on unified-memory APUs), `visible_vram_total_bytes` /
+  `visible_vram_used_bytes` (CPU-visible/BAR VRAM), and `preempt_used_bytes`.
+- `telemetry` — best-effort live card telemetry: `busy_percent`,
+  `temperature_millicelsius`, `power_microwatts`, and `clock_mhz`. A field is
+  omitted when the card/driver does not expose it.
+- `processes` — resident memory on this card attributed to Foundry-managed model
+  subprocesses. Each entry has `pid`, `model_id`, `display_name`, `vram_bytes`,
+  and `gtt_bytes`, read from the process's `fdinfo`. Always present (an empty
+  array when nothing is loaded).
+- `unattributed_vram_bytes` — VRAM in use on the card that is **not** attributable
+  to a Foundry process (the desktop, other applications): `vram_used_bytes` minus
+  the sum of process `vram_bytes`, clamped at zero.
+
+The memory-pool and attribution figures are best-effort: a source that is
+unavailable degrades to zero/omitted rather than failing the request.
 
 ```sh
 curl http://localhost:8080/api/v1/hardware

@@ -64,9 +64,10 @@ type Server struct {
 	uiEnabled bool
 
 	// Injectable for testing; default to the real sysfs implementations.
-	queryResources func() (vramAvail, ramAvail uint64, err error)
-	queryVRAMTotal func() (uint64, error)
-	queryHardware  func() (gpus []estimator.GPUInfo, ramAvail uint64, err error)
+	queryResources     func() (vramAvail, ramAvail uint64, err error)
+	queryVRAMTotal     func() (uint64, error)
+	queryHardware      func() (gpus []estimator.GPUInfo, ramAvail uint64, err error)
+	queryProcessGPUMem func(pids []int) ([]estimator.ProcessGPUMemory, error)
 }
 
 func New(addr string, reg *registry.Registry, pm *processmanager.Manager, est *estimator.Estimator, defaultGPULayers int, globalKVCacheType string, globalParallel int, resolvedModelOpts map[string]processmanager.ModelLoadOptions, logger *slog.Logger) *Server {
@@ -90,17 +91,18 @@ func (s *Server) SetHistoryStore(store history.Store) {
 
 func newServer(addr string, reg modelRegistry, pm processManager, est resourceEstimator, defaultGPULayers int, globalKVCacheType string, globalParallel int, resolvedModelOpts map[string]processmanager.ModelLoadOptions, logger *slog.Logger) *Server {
 	s := &Server{
-		registry:          reg,
-		procMgr:           pm,
-		estimator:         est,
-		defaultGPULayers:  defaultGPULayers,
-		globalKVCacheType: globalKVCacheType,
-		globalParallel:    globalParallel,
-		resolvedModelOpts: resolvedModelOpts,
-		logger:            logger,
-		queryResources:    estimator.QueryResources,
-		queryVRAMTotal:    estimator.QueryVRAMTotal,
-		queryHardware:     estimator.QueryHardware,
+		registry:           reg,
+		procMgr:            pm,
+		estimator:          est,
+		defaultGPULayers:   defaultGPULayers,
+		globalKVCacheType:  globalKVCacheType,
+		globalParallel:     globalParallel,
+		resolvedModelOpts:  resolvedModelOpts,
+		logger:             logger,
+		queryResources:     estimator.QueryResources,
+		queryVRAMTotal:     estimator.QueryVRAMTotal,
+		queryHardware:      estimator.QueryHardware,
+		queryProcessGPUMem: estimator.QueryProcessGPUMemory,
 	}
 
 	mux := http.NewServeMux()
@@ -206,6 +208,10 @@ type loadedModelInfo struct {
 	ContextSize        int    `json:"context_size"`
 	Health             string `json:"health"`
 	EstimatedVRAMBytes uint64 `json:"estimated_vram_bytes"`
+	// MeasuredVRAMBytes is the model subprocess's actual resident VRAM read from
+	// fdinfo. Zero when the measurement is unavailable (e.g. the process has not
+	// yet allocated, or attribution failed); the estimate above is always present.
+	MeasuredVRAMBytes uint64 `json:"measured_vram_bytes"`
 }
 
 type memoryInfo struct {
@@ -226,6 +232,42 @@ type gpuInfoResponse struct {
 	VRAMTotalBytes     uint64 `json:"vram_total_bytes"`
 	VRAMUsedBytes      uint64 `json:"vram_used_bytes"`
 	VRAMAvailableBytes uint64 `json:"vram_available_bytes"`
+	// Pools is the additional memory-pool breakdown (GTT, visible VRAM, preempt).
+	Pools gpuPoolsResponse `json:"pools"`
+	// Telemetry is best-effort live card telemetry; absent sources are omitted.
+	Telemetry gpuTelemetryResponse `json:"telemetry"`
+	// Processes attributes resident VRAM/GTT on this card to Foundry-managed
+	// model subprocesses. Always a JSON array (empty when nothing is loaded).
+	Processes []gpuProcessResponse `json:"processes"`
+	// UnattributedVRAMBytes is card VRAM in use that is not attributable to a
+	// Foundry-managed process (desktop, other apps): used minus the sum of
+	// process VRAM on this card, clamped to zero.
+	UnattributedVRAMBytes uint64 `json:"unattributed_vram_bytes"`
+}
+
+type gpuPoolsResponse struct {
+	GTTTotalBytes         uint64 `json:"gtt_total_bytes"`
+	GTTUsedBytes          uint64 `json:"gtt_used_bytes"`
+	VisibleVRAMTotalBytes uint64 `json:"visible_vram_total_bytes"`
+	VisibleVRAMUsedBytes  uint64 `json:"visible_vram_used_bytes"`
+	PreemptUsedBytes      uint64 `json:"preempt_used_bytes"`
+}
+
+// gpuTelemetryResponse carries optional live telemetry. Pointer fields are
+// omitted from JSON when the underlying source is unavailable on the card.
+type gpuTelemetryResponse struct {
+	BusyPercent       *uint64 `json:"busy_percent,omitempty"`
+	TemperatureMilliC *uint64 `json:"temperature_millicelsius,omitempty"`
+	PowerMicrowatts   *uint64 `json:"power_microwatts,omitempty"`
+	ClockMHz          *uint64 `json:"clock_mhz,omitempty"`
+}
+
+type gpuProcessResponse struct {
+	PID         int    `json:"pid"`
+	ModelID     uint64 `json:"model_id"`
+	DisplayName string `json:"display_name"`
+	VRAMBytes   uint64 `json:"vram_bytes"`
+	GTTBytes    uint64 `json:"gtt_bytes"`
 }
 
 type hardwareResponse struct {
@@ -516,14 +558,36 @@ func (s *Server) handleHardware(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Attribute per-card VRAM/GTT to Foundry-managed model subprocesses. This is
+	// best-effort enrichment: an attribution failure leaves processes empty and
+	// unattributed equal to the whole in-use figure rather than failing the call.
+	procsByCard := s.attributeGPUMemory()
+
 	entries := make([]gpuInfoResponse, 0, len(gpus))
 	for _, g := range gpus {
+		procs := procsByCard[g.Index]
+		if procs == nil {
+			procs = make([]gpuProcessResponse, 0)
+		}
+		var attributed uint64
+		for _, p := range procs {
+			attributed += p.VRAMBytes
+		}
+		var unattributed uint64
+		if g.VRAMUsed > attributed {
+			unattributed = g.VRAMUsed - attributed
+		}
+
 		entries = append(entries, gpuInfoResponse{
-			Index:              g.Index,
-			Identity:           g.Identity,
-			VRAMTotalBytes:     g.VRAMTotal,
-			VRAMUsedBytes:      g.VRAMUsed,
-			VRAMAvailableBytes: g.VRAMAvail,
+			Index:                 g.Index,
+			Identity:              g.Identity,
+			VRAMTotalBytes:        g.VRAMTotal,
+			VRAMUsedBytes:         g.VRAMUsed,
+			VRAMAvailableBytes:    g.VRAMAvail,
+			Pools:                 poolsResponse(g.Pools),
+			Telemetry:             telemetryResponse(g.Telemetry),
+			Processes:             procs,
+			UnattributedVRAMBytes: unattributed,
 		})
 	}
 
@@ -533,16 +597,109 @@ func (s *Server) handleHardware(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
+// attributeGPUMemory maps each AMD card index to the list of Foundry-managed
+// processes resident on it, labelled with model identity. Returns an empty map
+// on any attribution error (best-effort).
+func (s *Server) attributeGPUMemory() map[int][]gpuProcessResponse {
+	loaded := s.procMgr.List()
+	if len(loaded) == 0 {
+		return nil
+	}
+	pids := make([]int, 0, len(loaded))
+	pidInfo := make(map[int]*processmanager.LoadedModel, len(loaded))
+	for _, lm := range loaded {
+		pids = append(pids, lm.PID)
+		pidInfo[lm.PID] = lm
+	}
+
+	procMem, err := s.queryProcessGPUMem(pids)
+	if err != nil {
+		s.logger.Warn("gpu memory attribution failed", "error", err.Error())
+		return nil
+	}
+
+	byCard := make(map[int][]gpuProcessResponse)
+	for _, pm := range procMem {
+		lm := pidInfo[pm.PID]
+		if lm == nil {
+			continue
+		}
+		var displayName string
+		if m, found := s.registry.Get(lm.ModelID); found {
+			displayName = m.DisplayName
+		}
+		for _, c := range pm.Cards {
+			byCard[c.CardIndex] = append(byCard[c.CardIndex], gpuProcessResponse{
+				PID:         pm.PID,
+				ModelID:     lm.ModelID,
+				DisplayName: displayName,
+				VRAMBytes:   c.VRAMBytes,
+				GTTBytes:    c.GTTBytes,
+			})
+		}
+	}
+	return byCard
+}
+
+// measuredVRAMByPID returns each loaded subprocess PID's measured VRAM summed
+// across all cards. Best-effort: an attribution error yields an empty map.
+func (s *Server) measuredVRAMByPID(loaded []*processmanager.LoadedModel) map[int]uint64 {
+	if len(loaded) == 0 {
+		return nil
+	}
+	pids := make([]int, 0, len(loaded))
+	for _, lm := range loaded {
+		pids = append(pids, lm.PID)
+	}
+	procMem, err := s.queryProcessGPUMem(pids)
+	if err != nil {
+		s.logger.Warn("gpu memory attribution failed", "error", err.Error())
+		return nil
+	}
+	out := make(map[int]uint64, len(procMem))
+	for _, pm := range procMem {
+		var sum uint64
+		for _, c := range pm.Cards {
+			sum += c.VRAMBytes
+		}
+		out[pm.PID] = sum
+	}
+	return out
+}
+
+func poolsResponse(p estimator.GPUPools) gpuPoolsResponse {
+	return gpuPoolsResponse{
+		GTTTotalBytes:         p.GTTTotal,
+		GTTUsedBytes:          p.GTTUsed,
+		VisibleVRAMTotalBytes: p.VisVRAMTotal,
+		VisibleVRAMUsedBytes:  p.VisVRAMUsed,
+		PreemptUsedBytes:      p.PreemptUsed,
+	}
+}
+
+func telemetryResponse(t estimator.GPUTelemetry) gpuTelemetryResponse {
+	return gpuTelemetryResponse{
+		BusyPercent:       t.BusyPercent,
+		TemperatureMilliC: t.TemperatureMilliC,
+		PowerMicrowatts:   t.PowerMicroW,
+		ClockMHz:          t.ClockMHz,
+	}
+}
+
 func (s *Server) handleStatus(w http.ResponseWriter, r *http.Request) {
 	loaded := s.procMgr.List()
+
+	// Best-effort measured VRAM per subprocess PID (summed across cards).
+	measuredByPID := s.measuredVRAMByPID(loaded)
 
 	infos := make([]loadedModelInfo, len(loaded))
 	for i, lm := range loaded {
 		info := loadedModelInfo{
-			ModelID:     lm.ModelID,
-			Port:        lm.Port,
-			ContextSize: lm.ContextSize,
-			Health:      healthString(lm),
+			ModelID:           lm.ModelID,
+			Port:              lm.Port,
+			ContextSize:       lm.ContextSize,
+			Health:            healthString(lm),
+			MeasuredVRAMBytes: measuredByPID[lm.PID],
 		}
 		// Enrich with display name and an estimated VRAM cost when the model is
 		// still in the registry. Estimation is best-effort: a lookup miss or

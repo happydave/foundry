@@ -22,6 +22,42 @@ type GPUInfo struct {
 	VRAMTotal uint64
 	VRAMUsed  uint64
 	VRAMAvail uint64
+
+	// Pools carries the additional AMD memory-pool figures beyond dedicated
+	// VRAM. All are best-effort live reads; a pool whose sysfs file is absent
+	// reads as zero. On unified-memory APUs the GTT pool is significant.
+	Pools GPUPools
+	// Telemetry carries best-effort live card telemetry. Each field is a
+	// pointer so an absent sysfs/hwmon source is distinguishable from a real
+	// zero and can be omitted from API responses.
+	Telemetry GPUTelemetry
+}
+
+// GPUPools holds the AMD memory-pool figures (bytes) read from the card's sysfs
+// mem_info_* attributes. Zero indicates the corresponding attribute was absent
+// or unreadable.
+type GPUPools struct {
+	GTTTotal     uint64
+	GTTUsed      uint64
+	VisVRAMTotal uint64
+	VisVRAMUsed  uint64
+	PreemptUsed  uint64
+}
+
+// GPUTelemetry holds best-effort live card telemetry. A nil field means the
+// underlying source was unavailable on this card/driver.
+type GPUTelemetry struct {
+	// BusyPercent is the GPU utilization percentage (0-100) from
+	// gpu_busy_percent.
+	BusyPercent *uint64
+	// TemperatureMilliC is the edge temperature in millidegrees Celsius from
+	// hwmon temp1_input.
+	TemperatureMilliC *uint64
+	// PowerMicroW is average power draw in microwatts from hwmon power1_average.
+	PowerMicroW *uint64
+	// ClockMHz is the current core (sclk) clock in MHz — the active state in
+	// pp_dpm_sclk.
+	ClockMHz *uint64
 }
 
 // QueryHardware returns per-card VRAM detail for every AMD DRM card that exposes
@@ -67,6 +103,8 @@ func QueryHardware() (gpus []GPUInfo, ramAvail uint64, err error) {
 			VRAMTotal: total,
 			VRAMUsed:  used,
 			VRAMAvail: avail,
+			Pools:     readCardPools(deviceDir),
+			Telemetry: readCardTelemetry(deviceDir),
 		})
 	}
 
@@ -133,4 +171,91 @@ func readSysfsString(path string) string {
 		return ""
 	}
 	return string(data)
+}
+
+// readCardPools reads the AMD memory-pool attributes from a card's sysfs device
+// directory. Every read is best-effort: a missing or unreadable attribute
+// contributes zero and never fails the query.
+func readCardPools(deviceDir string) GPUPools {
+	read := func(name string) uint64 {
+		v, _ := readOptionalSysfsUint64(filepath.Join(deviceDir, name))
+		return v
+	}
+	return GPUPools{
+		GTTTotal:     read("mem_info_gtt_total"),
+		GTTUsed:      read("mem_info_gtt_used"),
+		VisVRAMTotal: read("mem_info_vis_vram_total"),
+		VisVRAMUsed:  read("mem_info_vis_vram_used"),
+		PreemptUsed:  read("mem_info_preempt_used"),
+	}
+}
+
+// readCardTelemetry reads best-effort live telemetry from a card's sysfs device
+// directory. Any source that is absent leaves the corresponding pointer nil.
+func readCardTelemetry(deviceDir string) GPUTelemetry {
+	var t GPUTelemetry
+	if v, ok := readOptionalSysfsUint64(filepath.Join(deviceDir, "gpu_busy_percent")); ok {
+		t.BusyPercent = &v
+	}
+	if v, ok := readHwmonUint64(deviceDir, "temp1_input"); ok {
+		t.TemperatureMilliC = &v
+	}
+	if v, ok := readHwmonUint64(deviceDir, "power1_average"); ok {
+		t.PowerMicroW = &v
+	}
+	if v, ok := currentDPMClockMHz(filepath.Join(deviceDir, "pp_dpm_sclk")); ok {
+		t.ClockMHz = &v
+	}
+	return t
+}
+
+// readOptionalSysfsUint64 reads a uint64 sysfs attribute, reporting ok=false
+// (rather than an error) when the file is absent or unparseable. Used for
+// best-effort figures that must never fail the overall query.
+func readOptionalSysfsUint64(path string) (uint64, bool) {
+	v, err := readSysfsUint64(path)
+	if err != nil {
+		return 0, false
+	}
+	return v, true
+}
+
+// readHwmonUint64 reads a named hwmon attribute for a card. The hwmon instance
+// number is not stable, so the single hwmon directory under the card's device
+// path is discovered by glob. Returns ok=false when absent or unreadable.
+func readHwmonUint64(deviceDir, attr string) (uint64, bool) {
+	matches, err := filepath.Glob(filepath.Join(deviceDir, "hwmon", "hwmon*", attr))
+	if err != nil || len(matches) == 0 {
+		return 0, false
+	}
+	return readOptionalSysfsUint64(matches[0])
+}
+
+// currentDPMClockMHz parses an AMD pp_dpm_* clock table and returns the active
+// state's frequency in MHz. Each line looks like "0: 600Mhz *"; the active line
+// is the one marked with a trailing "*". Returns ok=false when the file is
+// absent, empty, or no active line is found.
+func currentDPMClockMHz(path string) (uint64, bool) {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return 0, false
+	}
+	for _, line := range strings.Split(string(data), "\n") {
+		if !strings.HasSuffix(strings.TrimSpace(line), "*") {
+			continue
+		}
+		// Fields: "<index>:" "<freq>Mhz" "*"
+		fields := strings.Fields(line)
+		for _, f := range fields {
+			lower := strings.ToLower(f)
+			if !strings.HasSuffix(lower, "mhz") {
+				continue
+			}
+			numStr := strings.TrimSuffix(lower, "mhz")
+			if mhz, err := strconv.ParseUint(numStr, 10, 64); err == nil {
+				return mhz, true
+			}
+		}
+	}
+	return 0, false
 }
