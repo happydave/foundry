@@ -65,30 +65,124 @@ function toast(msg, kind) {
 
 // --- Hardware panel ---
 
+// Stable, theme-fitting palette for per-model memory segments. A model keeps its
+// colour across polls because the index is derived deterministically from its id.
+const SEG_PALETTE = [
+  "#5aa0ff", "#3fb950", "#d29922", "#bc8cff", "#f778ba",
+  "#56d4dd", "#e3b341", "#7ee787", "#ff9e64", "#a5a5ff",
+];
+
+// colorForModel maps an opaque model id string to a stable palette colour.
+function colorForModel(modelId) {
+  const s = String(modelId);
+  let h = 0;
+  for (let i = 0; i < s.length; i++) h = (h * 31 + s.charCodeAt(i)) >>> 0;
+  return SEG_PALETTE[h % SEG_PALETTE.length];
+}
+
+// stackedBar renders a proportional memory bar. segments is an array of
+// { bytes, color, title }; the track background shows the free remainder when the
+// segments sum to less than total.
+function stackedBar(segments, total) {
+  const track = el("div", "stack");
+  segments.forEach((s) => {
+    if (!s.bytes) return;
+    const seg = el("div", "seg");
+    seg.style.width = pct(s.bytes, total).toFixed(2) + "%";
+    seg.style.background = s.color;
+    if (s.title) seg.title = s.title; // title is set via property -> safe text
+    track.append(seg);
+  });
+  return track;
+}
+
+// telemetryChips builds the present-only telemetry readouts for a card.
+function telemetryChips(t) {
+  const wrap = el("div", "chips");
+  if (!t) return wrap;
+  if (t.busy_percent !== undefined && t.busy_percent !== null) {
+    wrap.append(el("span", "chip", `${Number(t.busy_percent)}% busy`));
+  }
+  if (t.temperature_millicelsius !== undefined && t.temperature_millicelsius !== null) {
+    wrap.append(el("span", "chip", `${(Number(t.temperature_millicelsius) / 1000).toFixed(0)}°C`));
+  }
+  if (t.power_microwatts !== undefined && t.power_microwatts !== null) {
+    wrap.append(el("span", "chip", `${(Number(t.power_microwatts) / 1e6).toFixed(1)} W`));
+  }
+  if (t.clock_mhz !== undefined && t.clock_mhz !== null) {
+    wrap.append(el("span", "chip", `${Number(t.clock_mhz)} MHz`));
+  }
+  return wrap;
+}
+
+// legendRow builds one legend entry: colour swatch, label (text), and value.
+function legendRow(color, label, value) {
+  const row = el("div", "legend-row");
+  const sw = el("span", "swatch");
+  if (color) sw.style.background = color; else sw.classList.add("free");
+  const name = el("span", "legend-name", label); // textContent -> safe
+  name.title = label; // full name on hover when the label is truncated (property -> safe)
+  const val = el("span", "legend-val", value);
+  row.append(sw, name, val);
+  return row;
+}
+
+function gpuCard(g) {
+  const card = el("div", "gpu-card");
+
+  const head = el("div", "gpu-head");
+  head.append(el("span", "gpu-name", `card${g.index} · ${g.identity}`));
+  head.append(telemetryChips(g.telemetry));
+  card.append(head);
+
+  const total = Number(g.vram_total_bytes);
+  const procs = g.processes || [];
+  const unattributed = Number(g.unattributed_vram_bytes || 0);
+
+  // VRAM header line + stacked bar.
+  card.append(el("div", "meter-label",
+    `VRAM ${fmtBytes(g.vram_used_bytes)} / ${fmtBytes(g.vram_total_bytes)}`));
+  const segments = procs.map((p) => ({
+    bytes: Number(p.vram_bytes),
+    color: colorForModel(p.model_id),
+    title: `${p.display_name || ("#" + p.model_id)} — ${fmtBytes(p.vram_bytes)}`,
+  }));
+  segments.push({ bytes: unattributed, color: "var(--muted)", title: `other — ${fmtBytes(unattributed)}` });
+  card.append(stackedBar(segments, total));
+
+  // Legend: one row per model, then other + free.
+  const legend = el("div", "legend");
+  procs.forEach((p) => {
+    legend.append(legendRow(colorForModel(p.model_id),
+      p.display_name || `#${p.model_id}`, fmtBytes(p.vram_bytes)));
+  });
+  legend.append(legendRow("var(--muted)", "other (unattributed)", fmtBytes(unattributed)));
+  const free = total > Number(g.vram_used_bytes) ? total - Number(g.vram_used_bytes) : 0;
+  legend.append(legendRow(null, "free", fmtBytes(free)));
+  card.append(legend);
+
+  // GTT pool line (APU-relevant). Only shown when the pool is reported.
+  if (g.pools && Number(g.pools.gtt_total_bytes) > 0) {
+    card.append(el("div", "meter-label",
+      `GTT ${fmtBytes(g.pools.gtt_used_bytes)} / ${fmtBytes(g.pools.gtt_total_bytes)}`));
+    card.append(stackedBar(
+      [{ bytes: Number(g.pools.gtt_used_bytes), color: "var(--accent)" }],
+      Number(g.pools.gtt_total_bytes)));
+  }
+
+  return card;
+}
+
 async function refreshHardware() {
   let hw;
   try { hw = await fetchJSON("/hardware"); }
   catch (e) { panelError("hardware-body", e); return; }
 
-  const table = el("table");
-  const thead = el("tr");
-  ["GPU", "Identity", "VRAM used / total", "Used"].forEach((h, i) => {
-    const th = el("th", i === 3 ? "num" : "", h);
-    thead.append(th);
-  });
-  table.append(thead);
-
-  (hw.gpus || []).forEach((g) => {
-    const tr = el("tr");
-    tr.append(el("td", "", "card" + g.index));
-    tr.append(el("td", "", g.identity));
-    tr.append(el("td", "", `${fmtBytes(g.vram_used_bytes)} / ${fmtBytes(g.vram_total_bytes)}`));
-    tr.append(barCell(g.vram_used_bytes, g.vram_total_bytes));
-    table.append(tr);
-  });
+  const wrap = el("div", "gpu-list");
+  (hw.gpus || []).forEach((g) => wrap.append(gpuCard(g)));
 
   const body = document.getElementById("hardware-body");
-  body.replaceChildren(table);
+  body.replaceChildren(wrap);
   body.append(el("p", "muted", `System RAM available: ${fmtBytes(hw.system_ram_available_bytes)}`));
 }
 
@@ -111,7 +205,7 @@ async function refreshStatus() {
 
   const table = el("table");
   const thead = el("tr");
-  ["Model", "Context", "Health", "Est. VRAM", "Est. % of total"].forEach((h, i) => {
+  ["Model", "Context", "Health", "Est. VRAM", "Meas. VRAM", "Meas. % of total"].forEach((h, i) => {
     thead.append(el("th", i >= 3 ? "num" : "", h));
   });
   table.append(thead);
@@ -124,7 +218,10 @@ async function refreshStatus() {
     h.append(el("span", "health " + (m.health || ""), m.health || "—"));
     tr.append(h);
     tr.append(el("td", "num", fmtBytes(m.estimated_vram_bytes)));
-    tr.append(barCell(m.estimated_vram_bytes, totalVRAM));
+    // measured_vram_bytes is 0 when unavailable; show a dash rather than "0 B".
+    const measured = Number(m.measured_vram_bytes || 0);
+    tr.append(el("td", "num", measured > 0 ? fmtBytes(measured) : "—"));
+    tr.append(barCell(measured, totalVRAM));
     table.append(tr);
   });
   body.replaceChildren(table);

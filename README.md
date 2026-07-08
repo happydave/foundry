@@ -305,11 +305,15 @@ http://<host>:<port>/ui/
 
 The console has three panels:
 
-- **Hardware** — each GPU's identity and VRAM used/total (with percentage), plus
-  available system RAM. These are measured figures from `GET /api/v1/hardware`.
-- **Loaded models** — display name, context size, health, and estimated VRAM for
-  each loaded model, from `GET /api/v1/status`. VRAM here is an *estimate* and is
-  labelled as such.
+- **Hardware** — one card per GPU showing what is using its memory, from
+  `GET /api/v1/hardware`: a segmented VRAM bar broken down by loaded model
+  (measured), an "other/unattributed" segment, and free space, with a matching
+  legend; the GTT pool used/total; and live telemetry chips (utilisation,
+  temperature, power, clock) when the card exposes them. Available system RAM is
+  shown below the cards.
+- **Loaded models** — display name, context size, health, and both *estimated*
+  and *measured* VRAM for each loaded model, from `GET /api/v1/status` (the bar
+  reflects measured).
 - **Models** — every discovered model with size and loaded state, with Load and
   Unload controls. Loading consults the resource estimate first and warns if the
   model will not fit or must use a reduced context.
